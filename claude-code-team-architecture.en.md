@@ -14,9 +14,10 @@
 3. [Task System](#3-task-system)
 4. [Agent Communication](#4-agent-communication)
 5. [Agent Lifecycle](#5-agent-lifecycle)
-6. [Storage Architecture](#6-storage-architecture)
-7. [Live Examples](#7-live-examples)
-8. [Prompt Engineering](#8-prompt-engineering)
+6. [tmux Internals Deep Dive](#6-tmux-internals-deep-dive)
+7. [Storage Architecture](#7-storage-architecture)
+8. [Live Examples](#8-live-examples)
+9. [Prompt Engineering](#9-prompt-engineering)
 
 ---
 
@@ -43,6 +44,7 @@ Claude Code's multi-agent team system is a filesystem-based distributed agent co
      ┌─────┴────────────────────┴─────┐
      │   Shared filesystem (~/.claude/) │
      │  ├── teams/{name}/config.json   │
+     │  ├── teams/{name}/inboxes/*.json│
      │  ├── tasks/{name}/*.json        │
      │  ├── session-env/{id}/          │
      │  ├── debug/{id}.txt             │
@@ -67,6 +69,7 @@ Claude Code's multi-agent team system is a filesystem-based distributed agent co
 | Resource | Path | Purpose |
 |----------|------|---------|
 | Team config | `~/.claude/teams/{name}/config.json` | Team metadata + member list |
+| Message inboxes | `~/.claude/teams/{name}/inboxes/{agentName}.json` | Agent message persistence (with read status) |
 | Task directory | `~/.claude/tasks/{name}/` | Shared task list |
 | Task lock file | `~/.claude/tasks/{name}/.lock` | Concurrency control |
 
@@ -124,13 +127,13 @@ Claude Code's multi-agent team system is a filesystem-based distributed agent co
 | `agentType` | string | — | Agent type: `team-lead`, `general-purpose`, `Explore`, `Plan`, etc. |
 | `model` | string | — | Underlying LLM model ID |
 | `joinedAt` | number | — | Unix millisecond timestamp |
-| `tmuxPaneId` | string | — | tmux pane ID (e.g. `%14`), empty for lead |
+| `tmuxPaneId` | string | — | tmux pane ID (e.g. `%14`), empty for lead, `"in-process"` for in-process backend |
 | `cwd` | string | — | Agent's working directory |
 | `subscriptions` | array | — | Message subscription list (currently always empty) |
 | `prompt` | string | ✓ | Initial task instructions (passed via Task tool) |
 | `color` | string | ✓ | UI color identifier, assigned in join order (see 2.5) |
 | `planModeRequired` | boolean | ✓ | Whether plan approval is required before execution |
-| `backendType` | string | ✓ | Runtime backend (currently `tmux`) |
+| `backendType` | string | ✓ | Runtime backend: `tmux` (separate tmux pane process) or `in-process` (same process as Lead) |
 | `isActive` | boolean | ✓ | Whether the agent is currently active |
 
 ### 2.4 Team Naming
@@ -377,25 +380,34 @@ The core communication tool, supporting 5 message types:
 Sender Agent                    System                      Receiver Agent
     │                            │                              │
     ├── SendMessage ───────────→│                              │
-    │                            ├── Check receiver state ───→│
+    │                            │                              │
+    │                            ├── 1. Write to receiver's     │
+    │                            │   inbox file                 │
+    │                            │   (inboxes/{name}.json,      │
+    │                            │    read=false)                │
+    │                            │                              │
+    │                            ├── 2. Check receiver state ──→│
     │                            │                              │
     │                            │ [Receiver idle]              │
-    │                            ├── Deliver immediately ────→│ (wake up)
+    │                            ├── Notify/wake up ──────────→│ (reads inbox)
     │                            │                              │
     │                            │ [Receiver busy]              │
-    │                            ├── Queue message              │
-    │                            │   (wait for turn end)        │
-    │                            ├── Turn ends ────────────→│ (deliver queued)
+    │                            ├── (wait for turn end)        │
+    │                            ├── Turn ends ───────────────→│ (reads inbox)
+    │                            │                              │
+    │                            │                              ├── Consume message
+    │                            │                              │   (read→true)
     │                            │                              │
 ```
 
 **Key characteristics:**
 
-1. **Auto-delivery**: Receivers don't need to check their inbox; messages are injected as new conversation turns
-2. **Queue buffering**: If receiver is mid-turn, messages queue and deliver when the turn ends
-3. **Idle notifications**: Agents auto-enter idle after each turn; system sends idle notification to Lead
-4. **Peer DM visibility**: DM summaries between teammates are included in idle notifications, visible to Lead
-5. **Inbox mechanism**: Messages are delivered to the receiver's inbox (`"Message sent to tester-01's inbox"`), system handles wake-up
+1. **Inbox file persistence**: Each message is written to the receiver's inbox file `~/.claude/teams/{team}/inboxes/{name}.json` (JSON array), new messages have `read: false`, updated to `read: true` after consumption
+2. **Auto-delivery**: Receivers don't need to check their inbox; messages are injected as new conversation turns
+3. **Queue buffering**: If receiver is mid-turn, messages wait in the inbox file and deliver when the turn ends
+4. **Idle notifications**: Agents auto-enter idle after each turn; system sends idle notification to Lead (also written to Lead's inbox file)
+5. **Peer DM visibility**: DM summaries between teammates are included in idle notifications, visible to Lead
+6. **Message retention**: Consumed messages are NOT removed from the inbox file; full history is preserved until TeamDelete
 
 ### 4.4 Idle Notification Format (Verified)
 
@@ -423,7 +435,52 @@ Sender Agent                    System                      Receiver Agent
 - An agent may send multiple consecutive idle notifications (e.g. 2 in quick succession after a turn ends) — this is normal behavior
 - `idleReason` has only been observed as `"available"`, other values may exist but were not triggered
 
-### 4.5 Communication Topology
+### 4.5 Inbox File Schema (Verified)
+
+**Path**: `~/.claude/teams/{team_name}/inboxes/{agentName}.json`
+
+**Creation timing**:
+- An agent's inbox file is created on first message receipt (e.g. `task_assignment` triggered by TaskUpdate assigning owner)
+- Team Lead's inbox file is created on first message from an agent
+
+**File format**: JSON array, each message is an object
+
+```jsonc
+[
+  {
+    "from": "team-lead",                  // string: sender name
+    "text": "Message body or JSON string", // string: message content (see type table below)
+    "timestamp": "2026-02-08T11:36:55Z",  // string: ISO 8601 timestamp
+    "read": true,                          // boolean: whether consumed by receiver
+    "summary": "Summary text",             // string (optional): SendMessage summary parameter
+    "color": "blue"                        // string (optional): sender agent's color identifier
+  }
+]
+```
+
+**Message types in the `text` field**:
+
+| Message Type | `text` Format | Trigger Source |
+|-------------|---------------|----------------|
+| Regular message | Plain text | `SendMessage(type="message")` |
+| task_assignment | JSON: `{"type":"task_assignment","taskId":"1",...}` | `TaskUpdate(owner=X)` |
+| idle_notification | JSON: `{"type":"idle_notification","idleReason":"available",...}` | Agent turn ends (automatic) |
+| shutdown_request | JSON: `{"type":"shutdown_request","requestId":"...",...}` | `SendMessage(type="shutdown_request")` |
+| shutdown_approved | JSON: `{"type":"shutdown_approved","paneId":"...",...}` | Agent approves shutdown |
+
+**`read` field behavior**:
+- Defaults to `false` on write
+- Updated to `true` after receiver process consumes the message (**written back to the same file**)
+- Consumed messages are **never deleted**; inbox file retains full message history
+
+**`color` field**:
+- Only present on messages sent by **non-Lead** agents
+- Value is the sender agent's color identifier from config.json
+
+**Lifecycle**:
+- On TeamDelete, the `inboxes/` directory is deleted along with `teams/{name}/`
+
+### 4.6 Communication Topology
 
 ```
                     ┌───────────┐
@@ -443,7 +500,7 @@ Sender Agent                    System                      Receiver Agent
 
 - **Star topology primary**: Lead communicates with each member
 - **P2P supported**: Teammates can DM each other directly
-- **No central message bus**: Messages are routed directly by the system, not stored intermediately
+- **File-based message storage**: All messages persist to `inboxes/{agentName}.json`; the system handles routing and wake-up
 
 ---
 
@@ -550,9 +607,157 @@ Actual notifications received by Lead (verified):
 
 ---
 
-## 6. Storage Architecture
+## 6. tmux Internals Deep Dive
 
-### 6.1 `~/.claude/` Directory Overview
+> This chapter was produced by creating a `tmux-probe` team and capturing live tmux state, process trees, and startup commands to fully trace agent behavior at the tmux layer.
+
+### 6.1 tmux Session Layout
+
+The team system runs inside the user's existing tmux session (in this case `dev`):
+
+```
+tmux session: "dev"
+├── window 0
+│   ├── pane %0  (ttys003) ← Team Lead: claude --dangerously-skip-permissions
+│   │                          PID 58657, main session process
+│   ├── pane %17 (ttys030) ← System helper pane (zsh)
+│   │
+│   └── pane %20 (ttys036) ← [dynamically created on spawn] Agent: probe-01
+│                              PID 9507, destroyed on TeamDelete
+└── window 1
+    └── pane %3  (ttys022) ← User terminal (zsh)
+```
+
+**Key**: Agent panes are **dynamically created and destroyed** — they do not persist after team cleanup.
+
+### 6.2 tmux Operations During Agent Spawn
+
+Pane state comparison before and after spawn:
+
+```
+Before spawn (3 panes):
+  %0  (80x55)  │ %17 (186x55)
+               │
+────────────────────────────────
+
+After spawn (4 panes):
+  %0  (80x55)  │ %17 (186x27)    ← top half (compressed)
+               ├──────────────
+               │ %20 (186x27)    ← new agent pane (bottom half)
+────────────────────────────────
+```
+
+Detailed execution sequence:
+
+```
+Lead calls Task(team_name=X, name=Y)
+    │
+    ├── 1. tmux split-window — vertically splits an existing pane
+    │      → %17 shrinks from 186x55 to 186x27 (top)
+    │      → new pane %20 = 186x27 (bottom)
+    │
+    ├── 2. Launch zsh in the new pane
+    │      PID 9424, PPID=41159 (tmux server)
+    │
+    ├── 3. Save shell environment snapshot
+    │      ~/.claude/shell-snapshots/snapshot-zsh-{timestamp}-{id}.sh
+    │
+    ├── 4. Execute claude command with full agent parameters
+    │      → claude process PID 9507, PPID=9424 (zsh)
+    │
+    └── 5. Register in config.json: tmuxPaneId="%20"
+```
+
+### 6.3 Agent Startup Command (Actual Capture)
+
+```bash
+# Team Lead (main session, no agent parameters)
+claude --dangerously-skip-permissions
+
+# Agent (full parameter chain, each with a specific purpose)
+/Users/night/.local/share/claude/versions/2.1.34 \
+  --agent-id probe-01@tmux-probe \              # globally unique ID for message routing
+  --agent-name probe-01 \                        # human-readable name for SendMessage recipient
+  --team-name tmux-probe \                       # team name for locating config.json and tasks/
+  --agent-color blue \                           # UI color identifier
+  --parent-session-id c93b690c-...-d9451b749ac2 \# Lead's session ID for message return path
+  --agent-type general-purpose \                 # agent type, determines available toolset
+  --dangerously-skip-permissions \               # permission mode (inherited from Lead)
+  --model claude-opus-4-6                        # LLM model
+```
+
+**Core finding**: An agent is just another `claude` CLI process distinguished by `--agent-*` parameters. Lead and agents run the **same binary** (`/Users/night/.local/share/claude/versions/2.1.34`).
+
+### 6.4 Process Tree (Actual Capture)
+
+```
+tmux server (PID 41159)
+│
+├── zsh (PID 41160, pane %0, /dev/ttys003)
+│   └── claude --dangerously-skip-permissions (PID 58657)  ← Team Lead
+│       ├── caffeinate -i -t 300                           ← prevent system sleep
+│       ├── alpaca-mcp-server serve                        ← MCP service process
+│       └── pyright-langserver --stdio                     ← language service
+│
+├── zsh (PID 9424, pane %20, /dev/ttys036)                 ← [dynamically created]
+│   └── claude --agent-id probe-01@... (PID 9507)          ← Agent process
+│       └── /bin/zsh -c source snapshot-*.sh && eval '...' ← Bash tool subprocess
+│
+├── zsh (PID 70762, pane %17, /dev/ttys030)                ← helper pane
+└── zsh (PID 62613, pane %3, /dev/ttys022)                 ← user terminal
+```
+
+PPID chain: `Bash subprocess → claude agent → zsh → tmux server`
+
+### 6.5 TTY and stdin Handling
+
+| Process | TTY | stdin | Notes |
+|---------|-----|-------|-------|
+| Team Lead (58657) | `/dev/ttys003` | Real terminal | Receives user keyboard input |
+| Agent (9507) | `/dev/ttys036` | tmux pseudo-terminal | Has TTY but no human interaction |
+| Agent's Bash subprocess | `??` | `/dev/null` | **No controlling terminal** |
+
+**Important implications:**
+- Agent's Bash tool forks a new zsh subprocess per invocation
+- Subprocess first `source`s the shell snapshot to restore environment, then executes the command
+- stdin comes from `/dev/null`, so **interactive commands are impossible** (`git rebase -i`, `vim`, `less`)
+- Environment variable `TMUX_PANE=%20` is accessible inside the agent
+
+### 6.6 Pane Lifecycle to tmux Operation Mapping
+
+| Lifecycle Event | tmux Operation | Process Impact |
+|----------------|----------------|----------------|
+| Team Lead starts | User runs `claude` in existing pane | No tmux operation |
+| Agent spawn | `tmux split-window` → new pane | New zsh → new claude process |
+| Agent active | claude runs in pane; observable via `tmux capture-pane` | Process running normally |
+| Agent idle | No tmux operation | Process alive, just not making API calls |
+| Agent shutdown (approve) | claude exits → zsh exits | Pane may remain but empty |
+| TeamDelete | `tmux kill-pane` destroys all agent panes | Entire process tree cleaned up |
+
+### 6.7 Why tmux as Process Manager
+
+| Requirement | tmux Solution | Alternative Comparison |
+|-------------|---------------|----------------------|
+| Process isolation | Independent terminal + process tree per pane | Docker too heavy; subprocess lacks terminal |
+| Environment inheritance | shell-snapshots → source to restore | Requires extra env passing mechanism |
+| No network needed | No socket/port between panes | HTTP/gRPC requires port management |
+| Observability | `tmux capture-pane -t %20 -p` shows live output | subprocess opaque to user |
+| Resource cleanup | `tmux kill-pane` single-command cleanup | Must manually kill process tree |
+| Cross-platform | Works on macOS / Linux | Windows unsupported (needs WSL) |
+| User visibility | User can switch to agent pane and watch live | subprocess invisible to user |
+
+### 6.8 tmux Limitations
+
+1. **Pane count**: Too many panes in one window makes each very small, affecting output display
+2. **No Windows support**: tmux is Unix-only; Windows users need WSL
+3. **Split direction**: Current vertical splits (horizontal stacking) progressively compress pane height with more agents
+4. **Pane IDs never recycled**: Destroyed pane IDs (e.g. `%20`) are never reused; IDs grow indefinitely over long sessions
+
+---
+
+## 7. Storage Architecture
+
+### 7.1 `~/.claude/` Directory Overview
 
 ```
 ~/.claude/
@@ -564,7 +769,10 @@ Actual notifications received by Lead (verified):
 │
 ├── teams/                        # Team configurations
 │   └── {team-name}/
-│       └── config.json           # Team metadata + member list
+│       ├── config.json           # Team metadata + member list
+│       └── inboxes/              # Message inboxes (verified)
+│           ├── team-lead.json    # Lead's message log
+│           └── {agentName}.json  # Each agent's message log
 │
 ├── tasks/                        # Task data
 │   └── {team-name}/              # Isolated per team
@@ -597,7 +805,7 @@ Actual notifications received by Lead (verified):
 └── telemetry/                    # Telemetry data
 ```
 
-### 6.2 Data Flow
+### 7.2 Data Flow
 
 ```
 TeamCreate
@@ -619,17 +827,69 @@ Task(team_name=X, name=Y)  [spawn agent]
 
 SendMessage
     │
-    └── In-memory routing (message content NOT persisted to filesystem)
+    ├── Write to receiver's inbox file (inboxes/{recipient}.json, read=false)
+    ├── Write to sender's JSONL (tool_use record)
+    ├── Notify receiver process (tmux backend: IPC; in-process backend: in-memory)
+    └── Receiver updates inbox file after consumption (read=true)
+    Note: "inbox" is an actual filesystem path, not an in-memory queue
 
 TeamDelete
     │
-    ├── Delete ~/.claude/teams/{name}/
+    ├── Delete ~/.claude/teams/{name}/ (including config.json and inboxes/ directory)
     └── Delete ~/.claude/tasks/{name}/
 ```
 
-### 6.3 Key Findings
+### 7.3 Key Findings
 
-1. **Messages don't persist to disk**: `SendMessage` routes messages through in-memory channels, not the filesystem. Message history is unrecoverable after session ends (except indirect traces in `debug/*.txt` logs).
+1. **Message delivery mechanism (second correction, verified via inbox-verify + delivery-probe teams)**:
+
+   The previous report's claim "inbox is an in-process memory queue" was **incorrect**. The inbox is an actual JSON file on the filesystem:
+
+   ```
+   Lead calls SendMessage(recipient="watcher", content="...")
+       │
+       ├── 1. Write to receiver's inbox file ← primary persistence path
+       │      ~/.claude/teams/{team}/inboxes/watcher.json
+       │      (append message object to JSON array, read=false)
+       │
+       ├── 2. Write to sender's JSONL (tool_use record) ← conversation history
+       │      ~/.claude/projects/{project}/{session-id}.jsonl
+       │
+       ├── 3. Notify receiver process ← wake-up mechanism (varies by backend)
+       │      tmux backend: Unix Domain Socket notification
+       │      in-process backend: direct in-memory delivery
+       │
+       └── 4. Receiver updates inbox file after consumption ← read status writeback
+              (read: false → true, message not deleted)
+   ```
+
+   **Inbox files are real**: `"Message sent to watcher's inbox"` refers to `~/.claude/teams/{team}/inboxes/{name}.json`. Every agent (including Team Lead) has an independent inbox file.
+
+   **Why the previous report missed inbox files**:
+   - Previous report searched with `find ~/.claude/ -name '*inbox*'` — while `*inbox*` should match `inboxes`
+   - The search was executed **after TeamDelete**, which deletes the `inboxes/` directory along with the team
+   - This led to the incorrect "no inbox files exist" conclusion
+
+   **Second verification evidence (inbox-verify team)**:
+
+   | Check | Result |
+   |-------|--------|
+   | After agent spawn | `inboxes/listener.json` appeared immediately (with task_assignment message) |
+   | After SendMessage | Message appended to `inboxes/listener.json`, `read: false` |
+   | After agent consumption | `read` field updated to `true` in the same file |
+   | After agent messages Lead | `inboxes/team-lead.json` created |
+   | idle_notification | Written as JSON string to Lead's inbox file |
+   | shutdown_request/approved | Both written to corresponding inbox files |
+   | After TeamDelete | `inboxes/` directory deleted along with `teams/{name}/` |
+
+   **Delivery mechanism varies by backend (delivery-probe team verification)**:
+
+   | Backend Type | Process Model | Message Persistence | Wake-up Notification |
+   |-------------|--------------|--------------------|--------------------|
+   | `tmux` | Separate processes (different tmux panes) | Write to inbox file | Unix Domain Socket |
+   | `in-process` | Same process | Write to inbox file | Direct in-memory delivery |
+
+   Both backends **use inbox files** as the message persistence layer. The only difference is the inter-process wake-up notification mechanism.
 
 2. **Task = File**: Each task is an independent JSON file with simple concurrency control via `.lock`. A lightweight "database" design.
 
@@ -637,11 +897,17 @@ TeamDelete
 
 4. **Shell snapshots**: Each agent spawn saves a shell environment snapshot (`shell-snapshots/`), ensuring new agents inherit correct environment variables.
 
+5. **Conversation persistence (JSONL)**: Each agent (including Lead) has an independent JSONL conversation log at `~/.claude/projects/{project-path}/{session-id}.jsonl`. This file records the complete conversation history including tool calls, tool results, and message exchanges.
+
+6. **Message persistence (Inbox files)**: Each agent has an independent inbox JSON file at `~/.claude/teams/{team}/inboxes/{name}.json`. This file records all messages received by that agent (with read status) and serves as the primary vehicle for message delivery. Inbox files are deleted on TeamDelete.
+
+7. **Agent backend types**: The system supports two agent backends — `tmux` (separate process in a tmux pane) and `in-process` (same process as Lead). The backend type is recorded in config.json's `backendType` field. When the Claude CLI process is not running inside tmux (`$TMUX` not set), the `in-process` backend is used.
+
 ---
 
-## 7. Live Examples
+## 8. Live Examples
 
-### 7.1 Analysis Team Timeline
+### 8.1 Analysis Team Timeline
 
 | Timestamp (ms) | Event | Files Affected |
 |-----------------|-------|----------------|
@@ -659,7 +925,7 @@ TeamDelete
 | — | Task #4 unblocked | 4.json blockedBy cleared |
 | — | Team Lead writes report | This document |
 
-### 7.2 Config Evolution
+### 8.2 Config Evolution
 
 **At creation (lead only):**
 ```json
@@ -678,7 +944,7 @@ TeamDelete
 ]
 ```
 
-### 7.3 Verification Team (verify-team) Test Record
+### 8.3 Verification Team (verify-team) Test Record
 
 A separate `verify-team` was created to validate report accuracy:
 
@@ -715,9 +981,9 @@ tester-02 ──SendMessage──→ team-lead (summary report)
 
 ---
 
-## 8. Prompt Engineering
+## 9. Prompt Engineering
 
-### 8.1 Agent Prompt Structure
+### 9.1 Agent Prompt Structure
 
 When Team Lead spawns an agent via the `Task` tool, the `prompt` parameter becomes the agent's **initial system instruction**, stored in full in `config.json`'s `prompt` field.
 
@@ -740,7 +1006,7 @@ When Team Lead spawns an agent via the `Task` tool, the `prompt` parameter becom
    "When done, send results to team-lead via SendMessage."
    ```
 
-### 8.2 System-Injected Context
+### 9.2 System-Injected Context
 
 Beyond the user-provided `prompt`, the system automatically injects:
 
@@ -752,7 +1018,7 @@ Beyond the user-provided `prompt`, the system automatically injects:
 | Team context | config.json | Team name, member list |
 | Environment | shell-snapshots | Shell environment variables |
 
-### 8.3 Agent Types and Tool Permissions
+### 9.3 Agent Types and Tool Permissions
 
 | agentType | Available Tools | Use Case |
 |-----------|----------------|----------|
@@ -771,7 +1037,7 @@ Beyond the user-provided `prompt`, the system automatically injects:
 | Agent (tmux pane) | Service Instance (Container) |
 | config.json | Service Registry |
 | tasks/*.json | Task Queue (simplified) |
-| SendMessage | Message Broker (in-memory) |
+| SendMessage + inboxes/ | Message Broker (file-persisted) |
 | .lock file | Distributed Lock |
 | shell-snapshots | Container Image |
 | TeamDelete | Service Mesh Teardown |
