@@ -143,15 +143,24 @@ Claude Code's multi-agent team system is a filesystem-based distributed agent co
 
 ### 2.5 Color Assignment Rules (Verified)
 
-Member colors are assigned automatically by spawn order. Team Lead has no color:
+Member colors are assigned automatically by registration order. Team Lead has no color. Complete **8-color cycle**:
 
-| Join Order | Color | Verified (analysis-team) | Verified (verify-team) |
-|------------|-------|--------------------------|------------------------|
-| 1st member | `blue` | researcher-config | tester-01 |
-| 2nd member | `green` | researcher-tasks | tester-02 |
-| 3rd member | `yellow` | researcher-comms | — |
+| Index (mod 8) | Color | Verified (tmux-verify) |
+|---------------|-------|----------------------|
+| 0 | `blue` | prober-01 (1st registered) |
+| 1 | `green` | color-02 (2nd registered) |
+| 2 | `yellow` | color-03 (3rd registered) |
+| 3 | `purple` | color-04 (8th registered, delayed start) |
+| 4 | `orange` | color-05 (4th registered) |
+| 5 | `pink` | color-06 (5th registered) |
+| 6 | `cyan` | color-07 (6th registered) |
+| 7 | `red` | color-08 (7th registered) |
 
-Inferred sequence: `blue → green → yellow → ...` (more colors require further verification).
+The 9th member color-09 was assigned `blue` (index 8 mod 8 = 0), confirming the cycle wraps around.
+
+**Color assignment formula**: `color = COLORS[memberIndex % 8]`
+
+**Note: config.json concurrent write race**: When multiple agents register simultaneously, lost updates may occur (e.g., color-04's entry was overwritten). However, the agent itself still holds the correct color assignment (passed via CLI parameter `--agent-color`).
 
 ### 2.6 tmux Pane ID Assignment (Verified)
 
@@ -688,6 +697,24 @@ claude --dangerously-skip-permissions
 
 **Core finding**: An agent is just another `claude` CLI process distinguished by `--agent-*` parameters. Lead and agents run the **same binary** (`/Users/night/.local/share/claude/versions/2.1.34`).
 
+**Complete native Agent CLI parameters (second verification)**:
+
+| Parameter | Purpose | Always Present |
+|-----------|---------|---------------|
+| `--agent-id` | Globally unique ID for message routing | Yes |
+| `--agent-name` | Human-readable name | Yes |
+| `--team-name` | Team affiliation | Yes |
+| `--agent-color` | UI color identifier | Yes |
+| `--parent-session-id` | Lead's session ID | Yes |
+| `--agent-type` | Agent type | Yes |
+| `--model` | LLM model | Yes |
+| `--dangerously-skip-permissions` | Bypass permission checks | **Conditional**: only when Lead uses this mode |
+| `--permission-mode` | Permission mode (6 choices) | **Conditional**: passed when Lead/caller specifies |
+| `--allowedTools` | Tool whitelist | **Conditional**: passed when tool restrictions are configured |
+| `--disallowedTools` | Tool blacklist | **Conditional**: passed when tool restrictions are configured |
+
+> Note: The last four conditional parameters are native Claude CLI features (confirmed via `claude --help`). Whether they are passed during Team spawn depends on the Lead's configuration. The `--agent-*` parameters are Team system internals not shown in `claude --help`.
+
 ### 6.4 Process Tree (Actual Capture)
 
 ```
@@ -829,7 +856,7 @@ SendMessage
     │
     ├── Write to receiver's inbox file (inboxes/{recipient}.json, read=false)
     ├── Write to sender's JSONL (tool_use record)
-    ├── Notify receiver process (tmux backend: IPC; in-process backend: in-memory)
+    ├── Notify receiver process (tmux backend: anonymous UDS socketpair; in-process backend: in-memory)
     └── Receiver updates inbox file after consumption (read=true)
     Note: "inbox" is an actual filesystem path, not an in-memory queue
 
@@ -856,7 +883,7 @@ TeamDelete
        │      ~/.claude/projects/{project}/{session-id}.jsonl
        │
        ├── 3. Notify receiver process ← wake-up mechanism (varies by backend)
-       │      tmux backend: Unix Domain Socket notification
+       │      tmux backend: anonymous UDS socketpair notification
        │      in-process backend: direct in-memory delivery
        │
        └── 4. Receiver updates inbox file after consumption ← read status writeback
@@ -886,10 +913,29 @@ TeamDelete
 
    | Backend Type | Process Model | Message Persistence | Wake-up Notification |
    |-------------|--------------|--------------------|--------------------|
-   | `tmux` | Separate processes (different tmux panes) | Write to inbox file | Unix Domain Socket |
+   | `tmux` | Separate processes (different tmux panes) | Write to inbox file | Anonymous UDS socketpair |
    | `in-process` | Same process | Write to inbox file | Direct in-memory delivery |
 
    Both backends **use inbox files** as the message persistence layer. The only difference is the inter-process wake-up notification mechanism.
+
+   **Wake-up mechanism deep verification (lsof inspection)**:
+
+   The tmux-backend Agent process was observed to have:
+   - **4 KQUEUE file descriptors** (macOS kernel event notification)
+   - **DIR handles** on `~/.claude/`, `~/.claude/commands`, `~/.claude/skills`, project `.claude/` — for general filesystem change monitoring (command/skill hot-reloading, etc.)
+   - **Anonymous UDS socketpairs** — inter-process notification channel between Lead and Agent (no filesystem path, not named sockets)
+   - **No** `.sock` / `.socket` named socket files
+
+   The Lead process additionally holds DIR handles on `~/.claude/tasks/{team}/` directories (Agents do not), used for monitoring Task file changes.
+
+   ```
+   Complete message delivery flow (tmux backend):
+   1. Sender calls SendMessage
+   2. System writes to receiver's inbox file (JSON append, read=false)
+   3. System notifies receiver process via anonymous UDS socketpair
+   4. Receiver reads inbox file, consumes message
+   5. Receiver updates inbox file (read=true)
+   ```
 
 2. **Task = File**: Each task is an independent JSON file with simple concurrency control via `.lock`. A lightweight "database" design.
 
@@ -902,6 +948,31 @@ TeamDelete
 6. **Message persistence (Inbox files)**: Each agent has an independent inbox JSON file at `~/.claude/teams/{team}/inboxes/{name}.json`. This file records all messages received by that agent (with read status) and serves as the primary vehicle for message delivery. Inbox files are deleted on TeamDelete.
 
 7. **Agent backend types**: The system supports two agent backends — `tmux` (separate process in a tmux pane) and `in-process` (same process as Lead). The backend type is recorded in config.json's `backendType` field. When the Claude CLI process is not running inside tmux (`$TMUX` not set), the `in-process` backend is used.
+
+8. **Environment variables** (mechanism-verify + tmux-verify team verification):
+
+   | Variable | Value | Lead | tmux Agent | in-process Agent |
+   |----------|-------|------|-----------|-----------------|
+   | `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` | `1` | Yes | Yes | Yes |
+   | `CLAUDECODE` | `1` | Yes | Yes | Yes |
+   | `CLAUDE_CODE_ENTRYPOINT` | `cli` | Yes | Yes | Yes |
+   | `TMUX_PANE` | `%XX` | Yes | Yes | No |
+
+   - `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` indicates team mode is enabled (experimental feature flag)
+   - `CLAUDECODE=1` identifies the Claude Code runtime environment
+   - Agent team information (team name, agent name, etc.) is passed via CLI parameters, not environment variables
+
+9. **Task subagent output path** (tmux-verify team verification):
+
+   Task tool (subagent) intermediate outputs are stored at:
+   ```
+   /tmp/claude-{uid}/{project-path-escaped}/tasks/{hash}.output
+   ```
+   Example: `/tmp/claude-501/-Users-night-working-o3cloud-.../tasks/b6b99ac.output`
+
+10. **config.json concurrent write race** (tmux-verify team discovery):
+
+    When multiple agents register simultaneously, config.json is subject to lost updates: multiple processes read the same version of config.json, each appends its member entry, and the last write overwrites earlier ones. In the tmux-verify team, color-04's registration entry was lost this way (though the agent itself still held the correct color assignment via `--agent-color` parameter, and communication was unaffected).
 
 ---
 
@@ -1026,6 +1097,35 @@ Beyond the user-provided `prompt`, the system automatically injects:
 | `Explore` | Read-only (Read, Grep, Glob, WebFetch...) | Code search, information gathering |
 | `Plan` | Read-only | Architecture design, planning |
 | `Bash` | Bash commands only | System operations, script execution |
+
+---
+
+### 9.4 Permission Modes (`--permission-mode`)
+
+Claude CLI natively supports 6 permission modes, passed via `--permission-mode` (confirmed via `claude --help`):
+
+| Mode | CLI Parameter | Behavior |
+|------|---------------|----------|
+| `default` | `--permission-mode default` | Default mode, requires user confirmation for sensitive operations |
+| `acceptEdits` | `--permission-mode acceptEdits` | Auto-accept file edit operations |
+| `bypassPermissions` | `--dangerously-skip-permissions` | Bypass all permission checks |
+| `plan` | `--permission-mode plan` | Read-only analysis mode |
+| `dontAsk` | `--permission-mode dontAsk` | Auto-reject uncertain operations |
+| `delegate` | `--permission-mode delegate` | Route permission requests to Lead via inbox protocol |
+
+> Note: In `delegate` mode, when an Agent attempts a restricted operation, it sends a `permission_request` message via the inbox. The Lead/Controller approves or rejects via `permission_response`. This mode was not tested in live verification.
+
+### 9.5 Tool Whitelist/Blacklist
+
+Claude CLI supports fine-grained tool access control via the following parameters (confirmed via `claude --help`):
+
+| Parameter | Purpose | Example |
+|-----------|---------|---------|
+| `--allowedTools` / `--allowed-tools` | Tool whitelist | `--allowedTools "Bash(git:*) Edit Read"` |
+| `--disallowedTools` / `--disallowed-tools` | Tool blacklist | `--disallowedTools "Write Bash"` |
+| `--tools` | Specify built-in tool list | `--tools "Bash,Edit,Read"` |
+
+These parameters provide more granular tool access control than `agentType` alone.
 
 ---
 
