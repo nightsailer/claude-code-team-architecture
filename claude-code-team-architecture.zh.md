@@ -1,8 +1,10 @@
 # Claude Code 多 Agent 团队协作机制 — 深度分析报告
 
-> 生成日期：2026-02-08
-> 分析环境：Claude Code CLI (claude-opus-4-6)
+> 生成日期：2026-02-08 | 更新日期：2026-02-13
+> 分析环境：Claude Code CLI (claude-opus-4-6) v2.1.34 ~ v2.1.41
 > 分析团队：analysis-team（1 lead + 3 researchers）
+> 验证团队：verify-team, schema-verify, advanced-verify, delegate-verify, plan-reject-verify, subs-verify 等
+> 验证覆盖率：V1（84 项，98.8% PASS）+ V2（38 项，100% PASS），共 28 个新发现
 
 ---
 
@@ -129,12 +131,12 @@ Claude Code 的多 Agent 团队协作系统是一个基于文件系统的分布�
 | `joinedAt` | number | — | Unix 毫秒时间戳 |
 | `tmuxPaneId` | string | — | tmux pane ID（如 `%14`），lead 为空字符串，in-process 后端为 `"in-process"` |
 | `cwd` | string | — | Agent 的工作目录 |
-| `subscriptions` | array | — | 消息订阅列表（当前均为空） |
+| `subscriptions` | array | — | 消息订阅列表（预留/未实现字段，运行时无效果，均为空数组） |
 | `prompt` | string | ✓ | Agent 的初始任务指令（由 Task 工具传入） |
 | `color` | string | ✓ | UI 颜色标识，按加入顺序分配（见 2.5 颜色分配规则） |
-| `planModeRequired` | boolean | ✓ | 是否要求先提交计划再执行 |
+| `planModeRequired` | boolean | ✓ | 是否要求先提交计划再执行（所有 teammate 的标准字段，默认 `false`；`true` 时 Agent 启动即进入 plan 模式，需通过 `plan_approval_request/response` 协议退出） |
 | `backendType` | string | ✓ | 运行后端：`tmux`（独立 tmux pane 进程）或 `in-process`（与 Lead 同进程） |
-| `isActive` | boolean | ✓ | 当前是否处于活跃状态 |
+| `isActive` | boolean | ✓ | 当前是否处于活跃状态（活跃时 `true`，idle 时 `false`；Agent 终止后成员条目从 `members` 数组中**完全移除**，而非标记为 inactive） |
 
 ### 2.4 团队命名
 
@@ -357,6 +359,18 @@ Agent 间通信的核心工具，支持 5 种消息类型：
 
 - **前提**：队员的 `planModeRequired: true`
 - **流程**：队员调用 `ExitPlanMode` → Lead 收到审批请求 → 批准/拒绝
+- **详细协议见** [§4.7 Plan Mode 机制](#47-plan-mode-机制)
+
+#### 4.1.6 permission_request / permission_response — 权限请求
+
+当 teammate 以 `--permission-mode acceptEdits`（Task tool `mode="delegate"` 映射）运行时，执行需要权限的操作会向 Lead 发送权限请求：
+
+```jsonc
+// Lead 通过 UI 审批后，系统自动生成 permission_response
+// Lead 无需手动调用 SendMessage 来处理权限请求
+```
+
+- **详细协议见** [§4.8 Permission 协议](#48-permission-协议)
 
 ### 4.2 SendMessage 响应格式
 
@@ -383,7 +397,30 @@ Agent 间通信的核心工具，支持 5 种消息类型：
   "request_id": "shutdown-1770536808909@tester-01",  // 格式: shutdown-{timestamp}@{agent_name}
   "target": "tester-01"
 }
+
+// broadcast 类型的响应（已验证）
+{
+  "success": true,
+  "message": "Message broadcast to 2 teammate(s): verifier-01, verifier-02",
+  "recipients": ["verifier-01", "verifier-02"],  // 实际接收者列表（message 响应无此字段）
+  "routing": {
+    "sender": "team-lead",
+    "target": "@team",            // broadcast 使用 "@team"，非 "@{name}"
+    "summary": "广播测试",
+    "content": "全体注意：广播测试消息"
+    // 注意：无 targetColor（广播无单一目标色）
+  }
+}
 ```
+
+**三种响应格式对比：**
+
+| 字段 | message | broadcast | shutdown_request |
+|------|---------|-----------|-----------------|
+| `routing.target` | `"@{name}"` | `"@team"` | — |
+| `routing.targetColor` | 有 | **无** | — |
+| `recipients` | **无** | 有（数组） | — |
+| `request_id` | **无** | **无** | 有 |
 
 ### 4.3 消息投递机制
 
@@ -452,7 +489,7 @@ Agent 间通信的核心工具，支持 5 种消息类型：
 **路径**：`~/.claude/teams/{team_name}/inboxes/{agentName}.json`
 
 **创建时机**：
-- Agent 的 inbox 文件在首次收到消息时创建（如 TaskUpdate 分配 owner 触发 `task_assignment`）
+- Agent 的 inbox 文件在 spawn 时创建——初始 prompt 作为第一条纯文本消息写入（`from: "team-lead"`，无 `summary` 和 `color` 字段）
 - Team Lead 的 inbox 文件在首次收到 Agent 消息时创建
 
 **文件格式**：JSON 数组，每条消息为一个对象
@@ -472,13 +509,19 @@ Agent 间通信的核心工具，支持 5 种消息类型：
 
 **`text` 字段的消息类型**：
 
-| 消息类型 | `text` 格式 | 触发来源 |
-|---------|-------------|---------|
-| 普通消息 | 纯文本 | `SendMessage(type="message")` |
-| task_assignment | JSON: `{"type":"task_assignment","taskId":"1",...}` | `TaskUpdate(owner=X)` |
-| idle_notification | JSON: `{"type":"idle_notification","idleReason":"available",...}` | Agent turn 结束（系统自动） |
-| shutdown_request | JSON: `{"type":"shutdown_request","requestId":"...",...}` | `SendMessage(type="shutdown_request")` |
-| shutdown_approved | JSON: `{"type":"shutdown_approved","paneId":"...",...}` | Agent 批准关闭 |
+| 消息类型 | `text` 格式 | 触发来源 | 完整字段 |
+|---------|-------------|---------|---------|
+| 普通消息 | 纯文本 | `SendMessage(type="message")` | — |
+| task_assignment | JSON 字符串 | `TaskUpdate(owner=X)` | `type, taskId, subject, description, assignedBy, timestamp` |
+| idle_notification | JSON 字符串 | Agent turn 结束（系统自动） | `type, from, timestamp, idleReason`；P2P 时额外含 `summary` |
+| shutdown_request | JSON 字符串 | `SendMessage(type="shutdown_request")` | `type, requestId, from, reason, timestamp` |
+| shutdown_approved | JSON 字符串 | Agent 批准关闭 | `type, requestId, from, timestamp, paneId, backendType` |
+| plan_approval_request | JSON 字符串 | Agent 调用 `ExitPlanMode`（`planModeRequired: true`） | `type, from, timestamp, planFilePath, planContent, requestId` |
+| plan_approval_response | JSON 字符串 | 系统自动审批 / Lead 手动发送 | `type, requestId, approved, timestamp`；approve 时含 `permissionMode`，reject 时含 `feedback` |
+| permission_request | JSON 字符串 | Agent 执行受限操作（`--permission-mode acceptEdits`） | `type, request_id, agent_id, tool_name, tool_use_id, description, input, permission_suggestions` |
+| permission_response | JSON 字符串 | 用户通过 UI 审批 | `type, request_id, subtype`；success 时含 `response`，error 时含 `error` |
+
+> **注意**：`teammate_terminated` 不通过 inbox 文件投递，而是通过系统级会话注入（conversation turn injection）送达 Lead，格式为：`"Task {id} (type: in_process_teammate) (status: completed)"`。
 
 **`read` 字段行为**：
 - 写入时默认 `false`
@@ -513,6 +556,251 @@ Agent 间通信的核心工具，支持 5 种消息类型：
 - **星型拓扑为主**：Lead 与每个成员通信
 - **支持 P2P**：队员之间可以直接 DM
 - **基于文件的消息存储**：所有消息持久化到 `inboxes/{agentName}.json`，由系统负责路由和唤醒
+
+### 4.7 Plan Mode 机制（已验证）
+
+#### 4.7.1 概述
+
+Plan Mode 强制 Agent 先规划再执行。`planModeRequired: true` 的 Agent 启动即进入只读 plan 模式，必须先提交计划，获得审批后才能使用完整工具集。
+
+```
+planModeRequired=true 的 Agent 生命周期:
+
+  启动 → [plan 模式，只读] → 编写计划 → ExitPlanMode
+                                              │
+                                              ├─ plan_approval_request → Lead inbox（信息通知）
+                                              ├─ 系统读取 Lead 当前 permissionMode
+                                              └─ plan_approval_response (approved=true) → Agent inbox
+                                                    │
+                                                    ▼
+                                              [退出 plan 模式，获得 permissionMode 权限] → 执行计划
+```
+
+**关键发现**：plan_approval_request 由 Claude Code **运行时基础设施自动审批**（169ms~878ms），非人工门控。自动审批不可禁用。plan mode 的实际作用是**强制 agent 先规划再执行**，而非要求人类审批。
+
+#### 4.7.2 plan_approval_request 消息格式
+
+Agent 调用 `ExitPlanMode` 后，系统生成此消息写入 Lead 的 inbox：
+
+```jsonc
+// inbox 外层格式
+{
+  "from": "planner-01",
+  "text": "<JSON-stringified plan_approval_request>",  // 内层 JSON 字符串
+  "timestamp": "2026-02-13T10:43:07.887Z",
+  "read": true
+  // 注意：无 color 字段（与普通 DM 不同）
+}
+```
+
+**内层消息体**：
+
+```jsonc
+{
+  "type": "plan_approval_request",
+  "from": "planner-01",                              // 发送方名称
+  "timestamp": "2026-02-13T10:43:07.887Z",           // ISO 8601
+  "planFilePath": "~/.claude/plans/{random-name}.md", // plan 文件绝对路径
+  "planContent": "<完整 Markdown 计划文本>",           // 计划内容（内联）
+  "requestId": "plan_approval-{epoch_ms}@{agentName}@{teamName}"
+}
+```
+
+#### 4.7.3 plan_approval_response 消息格式
+
+系统自动生成（或 Lead 手动通过 `SendMessage` 发送），写入 Agent 的 inbox：
+
+```jsonc
+// approve=true（自动审批，169~878ms 延迟）
+{
+  "type": "plan_approval_response",
+  "requestId": "plan_approval-{epoch_ms}@{agentName}@{teamName}",
+  "approved": true,
+  "timestamp": "2026-02-13T10:43:07.980Z",
+  "permissionMode": "acceptEdits"    // 审批后 Agent 获得的权限等级，继承 Lead 当前模式
+}
+
+// approve=false（Lead 手动发送的 reject）
+{
+  "type": "plan_approval_response",
+  "requestId": "plan_approval-{epoch_ms}@{agentName}@{teamName}",
+  "approved": false,
+  "feedback": "计划需要补充：请增加错误处理逻辑",  // 拒绝原因
+  "timestamp": "2026-02-13T12:19:03.344Z"
+  // 注意：reject 时无 permissionMode 字段
+}
+```
+
+**approve vs reject 字段对比**：
+
+| 字段 | approve=true | approve=false |
+|------|-------------|--------------|
+| `type` | `"plan_approval_response"` | `"plan_approval_response"` |
+| `requestId` | 有 | 有 |
+| `approved` | `true` | `false` |
+| `timestamp` | 有 | 有 |
+| `permissionMode` | **有**（如 `"acceptEdits"`, `"default"`） | **无** |
+| `feedback` | **无** | **有**（拒绝原因） |
+
+#### 4.7.4 自动审批机制
+
+| 测试 | Lead 权限模式 | 自动审批延迟 | 响应 `permissionMode` |
+|------|-------------|------------|---------------------|
+| #1 | accept edits on | 824ms | `"acceptEdits"` |
+| #2 | default | 394ms | `"default"` |
+| #3 | default | 878ms | `"default"` |
+| #4 | default | 169ms | `"default"` |
+
+- 自动审批由运行时基础设施执行，Lead 正在执行 `sleep` 时也会自动审批
+- `permissionMode` 反映 Lead 当前权限模式设置
+- 100ms 轮询也无法拦截自动审批
+- 同一 `requestId` 可收到多条 response，approve 优先于 reject
+
+#### 4.7.5 Reject 流程
+
+尽管自动审批使正常 reject 无法实现，但 reject 协议本身是完整的：
+
+1. Agent 收到 `approved: false` 后**保持 plan 模式**
+2. Agent 读取 `feedback` 内容
+3. Agent 根据 feedback 修改计划
+4. Agent 重新调用 `ExitPlanMode`，生成**新的 `requestId`**
+5. 新的 plan_approval_request 再次被自动审批
+
+#### 4.7.6 planModeRequired vs EnterPlanMode
+
+| 维度 | `planModeRequired: true` | 手动 `EnterPlanMode` |
+|------|------------------------|---------------------|
+| 触发方式 | Task tool `mode="plan"` | Agent 自主调用 |
+| 启动行为 | 启动即进入 plan 模式 | 任意时刻进入 |
+| 退出审批 | 需要 `plan_approval_request/response` 协议 | **无需审批**，直接退出 |
+| CLI 参数 | `--plan-mode-required`（独立标志） | 无额外参数 |
+| 适用范围 | 仅指定的 teammate | 所有 agent 可用 |
+
+> **注意**：非 plan-mode agent 调用 `ExitPlanMode` 是幂等的（返回 `"User has approved exiting plan mode"`），不会产生错误。agent 可自主通过 `EnterPlanMode` 进入 plan 模式，再通过 `ExitPlanMode` 退出，全程无需审批。
+
+### 4.8 Permission 协议（已验证）
+
+当 teammate 以 `--permission-mode acceptEdits` 运行（Task tool `mode="delegate"` 映射）时，执行项目目录外的操作会触发权限请求协议。
+
+#### 4.8.1 permission_request 消息格式
+
+Agent inbox 外层：
+
+```jsonc
+{
+  "from": "delegate-agent",
+  "text": "<JSON-stringified permission_request>",
+  "timestamp": "2026-02-13T11:01:02.304Z",
+  "color": "purple",    // 包含 color（与 plan_approval_request 不同）
+  "read": true
+}
+```
+
+**内层消息体**：
+
+```jsonc
+{
+  "type": "permission_request",
+  "request_id": "perm-{epoch_ms}-{random_7char}",     // 如 "perm-1770980462304-4uqstf5"
+  "agent_id": "delegate-agent",                        // 请求方名称（不含 @team 后缀）
+  "tool_name": "Bash",                                 // 请求使用的工具
+  "tool_use_id": "toolu_...",                          // Anthropic API tool_use ID
+  "description": "Create directory /tmp/delegate-test", // 工具调用描述
+  "input": { "command": "mkdir -p /tmp/delegate-test" },// 完整工具调用参数
+  "permission_suggestions": [                           // 建议的权限授予方式
+    {
+      "type": "addDirectories",
+      "directories": ["/tmp", "/tmp/delegate-test"],
+      "destination": "session"
+    }
+  ]
+}
+```
+
+**`permission_suggestions` 三种类型**：
+
+| 类型 | 说明 | 示例 |
+|------|------|------|
+| `addDirectories` | 添加目录白名单 | `{"type":"addDirectories","directories":["/tmp"],"destination":"session"}` |
+| `setMode` | 设置权限模式 | `{"type":"setMode","mode":"acceptEdits","destination":"session"}` |
+| `addRules` | 添加工具规则 | `{"type":"addRules","rules":[{"toolName":"Read","ruleContent":"//tmp/**"}],"behavior":"allow","destination":"session"}` |
+
+#### 4.8.2 permission_response 消息格式
+
+用户通过 UI 审批后，系统写入 Agent 的 inbox：
+
+```jsonc
+// 成功响应（用户批准）
+{
+  "type": "permission_response",
+  "request_id": "perm-1770980462304-4uqstf5",
+  "subtype": "success",
+  "response": {
+    "updated_input": { /* 原始或修改后的工具参数 */ },
+    "permission_updates": []
+  }
+}
+
+// 拒绝响应（用户拒绝）
+{
+  "type": "permission_response",
+  "request_id": "perm-1770980484351-5rzn82g",
+  "subtype": "error",
+  "error": "拒绝原因字符串"
+}
+```
+
+#### 4.8.3 权限触发矩阵（`acceptEdits` 模式）
+
+| 工具 | 操作 | 触发 permission_request |
+|------|------|----------------------|
+| Read | 读取项目目录内文件 | 否 |
+| Bash | 项目目录外 mkdir | **是** |
+| Write | 项目目录外创建文件 | **是** |
+| Read | 读取项目目录外文件 | **是** |
+
+**结论**：`acceptEdits` 模式下，项目目录内的 Read 不触发权限请求，但外部目录的所有操作（包括 Read）都触发。
+
+### 4.9 Lead Delegate UI 模式（已验证）
+
+> **注意**：Lead Delegate UI 模式与 Task tool 的 `mode="delegate"` 参数是两个独立概念。前者是 Lead 的 UI 模式切换，后者是 teammate 的权限模式。
+
+#### 4.9.1 定义
+
+Delegate 模式是 **Team Lead 的 UI 模式**，通过用户在 Claude Code UI 中按 Tab 键切换。它是纯 UI 层行为——config.json 和 CLI 参数中无任何 delegate 标记。
+
+#### 4.9.2 实现机制
+
+进入 delegate 模式时，系统通过 `system-reminder` 注入约束（每次工具调用后重复注入）：
+
+```
+## Delegate Mode
+
+You are in delegate mode for team "{team_name}". In this mode, you can ONLY use the following tools:
+- TeammateTool: For spawning teammates, sending messages, and team coordination
+- TaskCreate: For creating new tasks
+- TaskGet: For retrieving task details
+- TaskUpdate: For updating task status and adding comments
+- TaskList: For listing all tasks
+
+You CANNOT use any other tools (Bash, Read, Write, Edit, etc.) until you exit delegate mode.
+```
+
+#### 4.9.3 可用工具
+
+| 工具 | 可用 | 用途 |
+|------|------|------|
+| TeammateTool（Task/SendMessage） | ✅ | spawn teammate、发送消息 |
+| TaskCreate / TaskGet / TaskUpdate / TaskList | ✅ | 任务 CRUD |
+| Bash / Read / Write / Edit / Glob / Grep | ❌ | 被禁用 |
+
+#### 4.9.4 对 Teammate 的影响
+
+Lead 的 delegate UI 模式**不影响 teammate 的 CLI 参数和权限**。在 delegate 模式下 spawn 的 teammate（未指定 Task tool `mode`）与普通模式下 spawn 的 teammate 完全一致。
+
+#### 4.9.5 已知限制
+
+退出 delegate 模式后，部分工具**可能不立即恢复**。实测中 Bash 和 Read 仍报 `"No such tool available"`，而 Glob 可用。推测与上下文中工具列表的缓存有关。
 
 ---
 
@@ -607,14 +895,16 @@ Lead 收到的实际通知（已验证）：
   "backendType": "tmux"      // 运行后端
 }
 
-// 2. 系统确认终止（来自 teammate_id="system"）
-{
-  "type": "teammate_terminated",
-  "message": "tester-01 has shut down."
-}
+// 2. 系统确认终止（非 inbox 投递，而是系统会话注入）
+// Lead 实际收到的是 Task 工具完成通知，格式为：
+// "Task {id} (type: in_process_teammate) (status: completed)"
 ```
 
-**注意**：`teammate_terminated` 和 `shutdown_approved` 几乎同时到达，顺序可能交替（实测中 `teammate_terminated` 略早于 `shutdown_approved`）。
+**注意**：
+- `shutdown_approved` 通过 inbox 文件投递，Lead 在消费 inbox 时读取
+- `teammate_terminated` **不通过 inbox 文件投递**，而是通过系统级会话注入（conversation turn injection）送达 Lead
+- 两者几乎同时到达，顺序可能交替
+- Agent 终止后，其成员条目从 config.json 的 `members` 数组中**完全移除**
 
 ---
 
@@ -710,6 +1000,7 @@ claude --dangerously-skip-permissions
 | `--parent-session-id` | Lead 的会话 ID | 是 |
 | `--agent-type` | Agent 类型 | 是 |
 | `--model` | LLM 模型 | 是 |
+| `--plan-mode-required` | 强制 Agent 启动即进入 plan 模式 | **条件性**：Task tool `mode="plan"` 时传递（独立布尔标志，与 `--permission-mode` 正交） |
 | `--dangerously-skip-permissions` | 绕过权限检查 | **条件性**：仅当 Lead 使用该模式时传递 |
 | `--permission-mode` | 权限模式（6 种） | **条件性**：由 Lead 或调用方指定时传递 |
 | `--allowedTools` | 工具白名单 | **条件性**：配置了工具限制时传递 |
@@ -1111,9 +1402,21 @@ Claude CLI 原生支持 6 种权限模式，通过 `--permission-mode` 参数传
 | `bypassPermissions` | `--dangerously-skip-permissions` | 绕过所有权限检查 |
 | `plan` | `--permission-mode plan` | 只读分析模式 |
 | `dontAsk` | `--permission-mode dontAsk` | 自动拒绝不确定的操作 |
-| `delegate` | `--permission-mode delegate` | 通过 inbox 协议将权限请求转发给 Lead |
+| `delegate` | `--permission-mode delegate` | 通过 inbox 协议将权限请求转发给 Lead（详见 §4.8） |
 
-> 注：`delegate` 模式下，Agent 执行受限操作时会通过 inbox 发送 `permission_request` 消息，由 Lead/Controller 审批后通过 `permission_response` 回传。该模式在本次验证中未实测触发。
+> 注：`delegate` 模式下（实际映射为 `acceptEdits`），Agent 执行受限操作时通过 inbox 发送 `permission_request` 消息，由用户通过 UI 审批后系统生成 `permission_response` 回传。（已验证）
+
+#### Task tool `mode` 参数与 CLI 参数的映射关系（已验证）
+
+| Task tool `mode` | CLI 参数 | config.json 字段 | 说明 |
+|-------------------|---------|-----------------|------|
+| `"plan"` | `--plan-mode-required` | `planModeRequired: true` | 独立布尔标志，与权限模式正交 |
+| `"delegate"` | `--permission-mode acceptEdits` | **无**（权限模式不记录在 config.json 中） | 内部映射，仅通过 CLI 参数传递 |
+| `"acceptEdits"` | `--permission-mode acceptEdits` | **无** | 直接映射 |
+| `"bypassPermissions"` | `--dangerously-skip-permissions` | **无** | 直接映射 |
+| 未指定 | 无 `--permission-mode` | **无** | 继承默认行为 |
+
+**关键发现**：teammate 的权限模式**不记录在 config.json 中**，仅通过 CLI 参数传递。从 config.json 无法推断 teammate 的权限模式。
 
 ### 9.5 工具白名单/黑名单
 

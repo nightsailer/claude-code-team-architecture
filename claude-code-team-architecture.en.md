@@ -1,9 +1,10 @@
 # Claude Code Multi-Agent Team Collaboration — Deep Architecture Analysis
 
-> Generated: 2026-02-08
-> Environment: Claude Code CLI (claude-opus-4-6)
+> Generated: 2026-02-08 | Updated: 2026-02-13
+> Environment: Claude Code CLI (claude-opus-4-6) v2.1.34 ~ v2.1.41
 > Analysis team: analysis-team (1 lead + 3 researchers)
-> Verification team: verify-team (1 lead + 2 testers)
+> Verification teams: verify-team, schema-verify, advanced-verify, delegate-verify, plan-reject-verify, subs-verify, etc.
+> Verification coverage: V1 (84 items, 98.8% PASS) + V2 (38 items, 100% PASS), 28 new findings
 
 ---
 
@@ -129,12 +130,12 @@ Claude Code's multi-agent team system is a filesystem-based distributed agent co
 | `joinedAt` | number | — | Unix millisecond timestamp |
 | `tmuxPaneId` | string | — | tmux pane ID (e.g. `%14`), empty for lead, `"in-process"` for in-process backend |
 | `cwd` | string | — | Agent's working directory |
-| `subscriptions` | array | — | Message subscription list (currently always empty) |
+| `subscriptions` | array | — | Message subscription list (reserved/unimplemented field, no runtime effect, always empty array) |
 | `prompt` | string | ✓ | Initial task instructions (passed via Task tool) |
 | `color` | string | ✓ | UI color identifier, assigned in join order (see 2.5) |
-| `planModeRequired` | boolean | ✓ | Whether plan approval is required before execution |
+| `planModeRequired` | boolean | ✓ | Whether the agent must submit a plan before execution (standard field for ALL teammates, default `false`; when `true`, agent starts in plan mode and must go through `plan_approval_request/response` protocol to exit) |
 | `backendType` | string | ✓ | Runtime backend: `tmux` (separate tmux pane process) or `in-process` (same process as Lead) |
-| `isActive` | boolean | ✓ | Whether the agent is currently active |
+| `isActive` | boolean | ✓ | Whether the agent is currently active (`true` when active, `false` when idle; on termination the member entry is **completely removed** from the `members` array, not marked inactive) |
 
 ### 2.4 Team Naming
 
@@ -357,6 +358,18 @@ The core communication tool, supporting 5 message types:
 
 - **Prerequisite**: Member's `planModeRequired: true`
 - **Flow**: Member calls `ExitPlanMode` → Lead receives approval request → Approve/Reject
+- **Detailed protocol**: See [§4.7 Plan Mode Mechanism](#47-plan-mode-mechanism)
+
+#### 4.1.6 permission_request / permission_response — Permission Request
+
+When a teammate runs with `--permission-mode acceptEdits` (mapped from Task tool `mode="delegate"`), restricted operations trigger permission requests to the Lead:
+
+```jsonc
+// Lead approves via UI, system auto-generates permission_response
+// Lead does not need to manually call SendMessage to handle permission requests
+```
+
+- **Detailed protocol**: See [§4.8 Permission Protocol](#48-permission-protocol)
 
 ### 4.2 SendMessage Response Format (Verified)
 
@@ -381,7 +394,30 @@ The core communication tool, supporting 5 message types:
   "request_id": "shutdown-1770536808909@tester-01",  // format: shutdown-{timestamp}@{agent_name}
   "target": "tester-01"
 }
+
+// broadcast type response (verified)
+{
+  "success": true,
+  "message": "Message broadcast to 2 teammate(s): verifier-01, verifier-02",
+  "recipients": ["verifier-01", "verifier-02"],  // actual recipient list (absent in message response)
+  "routing": {
+    "sender": "team-lead",
+    "target": "@team",            // broadcast uses "@team", not "@{name}"
+    "summary": "Broadcast test",
+    "content": "Attention all: broadcast test message"
+    // Note: no targetColor (broadcast has no single target color)
+  }
+}
 ```
+
+**Comparison of three response formats:**
+
+| Field | message | broadcast | shutdown_request |
+|-------|---------|-----------|-----------------|
+| `routing.target` | `"@{name}"` | `"@team"` | — |
+| `routing.targetColor` | Present | **Absent** | — |
+| `recipients` | **Absent** | Present (array) | — |
+| `request_id` | **Absent** | **Absent** | Present |
 
 ### 4.3 Message Delivery Mechanism
 
@@ -449,7 +485,7 @@ Sender Agent                    System                      Receiver Agent
 **Path**: `~/.claude/teams/{team_name}/inboxes/{agentName}.json`
 
 **Creation timing**:
-- An agent's inbox file is created on first message receipt (e.g. `task_assignment` triggered by TaskUpdate assigning owner)
+- An agent's inbox file is created on spawn — the initial prompt is written as the first plain text message (`from: "team-lead"`, no `summary` or `color` fields)
 - Team Lead's inbox file is created on first message from an agent
 
 **File format**: JSON array, each message is an object
@@ -469,13 +505,19 @@ Sender Agent                    System                      Receiver Agent
 
 **Message types in the `text` field**:
 
-| Message Type | `text` Format | Trigger Source |
-|-------------|---------------|----------------|
-| Regular message | Plain text | `SendMessage(type="message")` |
-| task_assignment | JSON: `{"type":"task_assignment","taskId":"1",...}` | `TaskUpdate(owner=X)` |
-| idle_notification | JSON: `{"type":"idle_notification","idleReason":"available",...}` | Agent turn ends (automatic) |
-| shutdown_request | JSON: `{"type":"shutdown_request","requestId":"...",...}` | `SendMessage(type="shutdown_request")` |
-| shutdown_approved | JSON: `{"type":"shutdown_approved","paneId":"...",...}` | Agent approves shutdown |
+| Message Type | `text` Format | Trigger Source | Complete Fields |
+|-------------|---------------|----------------|----------------|
+| Regular message | Plain text | `SendMessage(type="message")` | — |
+| task_assignment | JSON string | `TaskUpdate(owner=X)` | `type, taskId, subject, description, assignedBy, timestamp` |
+| idle_notification | JSON string | Agent turn ends (automatic) | `type, from, timestamp, idleReason`; P2P adds `summary` |
+| shutdown_request | JSON string | `SendMessage(type="shutdown_request")` | `type, requestId, from, reason, timestamp` |
+| shutdown_approved | JSON string | Agent approves shutdown | `type, requestId, from, timestamp, paneId, backendType` |
+| plan_approval_request | JSON string | Agent calls `ExitPlanMode` (`planModeRequired: true`) | `type, from, timestamp, planFilePath, planContent, requestId` |
+| plan_approval_response | JSON string | Auto-approved by system / Lead manual send | `type, requestId, approved, timestamp`; approve adds `permissionMode`, reject adds `feedback` |
+| permission_request | JSON string | Agent performs restricted op (`--permission-mode acceptEdits`) | `type, request_id, agent_id, tool_name, tool_use_id, description, input, permission_suggestions` |
+| permission_response | JSON string | User approves via UI | `type, request_id, subtype`; success adds `response`, error adds `error` |
+
+> **Note**: `teammate_terminated` is NOT delivered via inbox files. It is delivered via system-level conversation turn injection to the Lead, in the format: `"Task {id} (type: in_process_teammate) (status: completed)"`.
 
 **`read` field behavior**:
 - Defaults to `false` on write
@@ -510,6 +552,251 @@ Sender Agent                    System                      Receiver Agent
 - **Star topology primary**: Lead communicates with each member
 - **P2P supported**: Teammates can DM each other directly
 - **File-based message storage**: All messages persist to `inboxes/{agentName}.json`; the system handles routing and wake-up
+
+### 4.7 Plan Mode Mechanism (Verified)
+
+#### 4.7.1 Overview
+
+Plan Mode forces an agent to plan before executing. Agents with `planModeRequired: true` start in read-only plan mode and must submit a plan and receive approval before gaining full tool access.
+
+```
+Lifecycle of planModeRequired=true agent:
+
+  Start → [plan mode, read-only] → Write plan → ExitPlanMode
+                                                     │
+                                                     ├─ plan_approval_request → Lead inbox (info notification)
+                                                     ├─ System reads Lead's current permissionMode
+                                                     └─ plan_approval_response (approved=true) → Agent inbox
+                                                           │
+                                                           ▼
+                                                     [Exit plan mode, gain permissionMode] → Execute plan
+```
+
+**Key finding**: plan_approval_request is **automatically approved by Claude Code runtime infrastructure** (169ms–878ms), not human-gated. Auto-approval cannot be disabled. Plan mode's actual purpose is to **force the agent to plan before executing**, not to require human approval.
+
+#### 4.7.2 plan_approval_request Message Format
+
+Generated when an agent calls `ExitPlanMode`, written to Lead's inbox:
+
+```jsonc
+// inbox outer format
+{
+  "from": "planner-01",
+  "text": "<JSON-stringified plan_approval_request>",  // inner JSON string
+  "timestamp": "2026-02-13T10:43:07.887Z",
+  "read": true
+  // Note: no color field (differs from regular DMs)
+}
+```
+
+**Inner message body**:
+
+```jsonc
+{
+  "type": "plan_approval_request",
+  "from": "planner-01",                              // sender name
+  "timestamp": "2026-02-13T10:43:07.887Z",           // ISO 8601
+  "planFilePath": "~/.claude/plans/{random-name}.md", // absolute path to plan file
+  "planContent": "<full Markdown plan text>",         // plan content (inline)
+  "requestId": "plan_approval-{epoch_ms}@{agentName}@{teamName}"
+}
+```
+
+#### 4.7.3 plan_approval_response Message Format
+
+Auto-generated by the system (or manually sent by Lead via `SendMessage`), written to the agent's inbox:
+
+```jsonc
+// approve=true (auto-approved, 169–878ms delay)
+{
+  "type": "plan_approval_response",
+  "requestId": "plan_approval-{epoch_ms}@{agentName}@{teamName}",
+  "approved": true,
+  "timestamp": "2026-02-13T10:43:07.980Z",
+  "permissionMode": "acceptEdits"    // permission level granted, inherits Lead's current mode
+}
+
+// approve=false (manual reject by Lead)
+{
+  "type": "plan_approval_response",
+  "requestId": "plan_approval-{epoch_ms}@{agentName}@{teamName}",
+  "approved": false,
+  "feedback": "Plan needs error handling logic",  // rejection reason
+  "timestamp": "2026-02-13T12:19:03.344Z"
+  // Note: no permissionMode field on reject
+}
+```
+
+**approve vs reject field comparison**:
+
+| Field | approve=true | approve=false |
+|-------|-------------|--------------|
+| `type` | `"plan_approval_response"` | `"plan_approval_response"` |
+| `requestId` | Present | Present |
+| `approved` | `true` | `false` |
+| `timestamp` | Present | Present |
+| `permissionMode` | **Present** (e.g. `"acceptEdits"`, `"default"`) | **Absent** |
+| `feedback` | **Absent** | **Present** (rejection reason) |
+
+#### 4.7.4 Auto-Approval Mechanism
+
+| Test | Lead Permission Mode | Auto-Approval Delay | Response `permissionMode` |
+|------|---------------------|--------------------|-----------------------------|
+| #1 | accept edits on | 824ms | `"acceptEdits"` |
+| #2 | default | 394ms | `"default"` |
+| #3 | default | 878ms | `"default"` |
+| #4 | default | 169ms | `"default"` |
+
+- Auto-approval is executed by the runtime infrastructure; it occurs even while Lead is running `sleep`
+- `permissionMode` reflects the Lead's current permission mode setting
+- 100ms polling cannot intercept auto-approval
+- The same `requestId` can receive multiple responses; approve takes priority over reject
+
+#### 4.7.5 Reject Flow
+
+Although auto-approval makes normal rejection impractical, the reject protocol itself is complete:
+
+1. Agent receives `approved: false` and **stays in plan mode**
+2. Agent reads `feedback` content
+3. Agent revises the plan based on feedback
+4. Agent calls `ExitPlanMode` again, generating a **new `requestId`**
+5. The new plan_approval_request is auto-approved again
+
+#### 4.7.6 planModeRequired vs EnterPlanMode
+
+| Dimension | `planModeRequired: true` | Manual `EnterPlanMode` |
+|-----------|------------------------|----------------------|
+| Trigger | Task tool `mode="plan"` | Agent calls it voluntarily |
+| Startup behavior | Starts in plan mode | Enter at any time |
+| Exit approval | Requires `plan_approval_request/response` protocol | **No approval needed**, exits directly |
+| CLI parameter | `--plan-mode-required` (independent flag) | No extra parameter |
+| Scope | Only the designated teammate | Available to all agents |
+
+> **Note**: Calling `ExitPlanMode` on a non-plan-mode agent is idempotent (returns `"User has approved exiting plan mode"`) and does not error. Agents can voluntarily enter plan mode via `EnterPlanMode` and exit via `ExitPlanMode` without any approval protocol.
+
+### 4.8 Permission Protocol (Verified)
+
+When a teammate runs with `--permission-mode acceptEdits` (mapped from Task tool `mode="delegate"`), operations outside the project directory trigger the permission request protocol.
+
+#### 4.8.1 permission_request Message Format
+
+Agent inbox outer format:
+
+```jsonc
+{
+  "from": "delegate-agent",
+  "text": "<JSON-stringified permission_request>",
+  "timestamp": "2026-02-13T11:01:02.304Z",
+  "color": "purple",    // includes color (differs from plan_approval_request)
+  "read": true
+}
+```
+
+**Inner message body**:
+
+```jsonc
+{
+  "type": "permission_request",
+  "request_id": "perm-{epoch_ms}-{random_7char}",     // e.g. "perm-1770980462304-4uqstf5"
+  "agent_id": "delegate-agent",                        // requester name (without @team suffix)
+  "tool_name": "Bash",                                 // requested tool
+  "tool_use_id": "toolu_...",                          // Anthropic API tool_use ID
+  "description": "Create directory /tmp/delegate-test", // tool call description
+  "input": { "command": "mkdir -p /tmp/delegate-test" },// full tool call parameters
+  "permission_suggestions": [                           // suggested permission grants
+    {
+      "type": "addDirectories",
+      "directories": ["/tmp", "/tmp/delegate-test"],
+      "destination": "session"
+    }
+  ]
+}
+```
+
+**Three types of `permission_suggestions`**:
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `addDirectories` | Add directory whitelist | `{"type":"addDirectories","directories":["/tmp"],"destination":"session"}` |
+| `setMode` | Set permission mode | `{"type":"setMode","mode":"acceptEdits","destination":"session"}` |
+| `addRules` | Add tool rules | `{"type":"addRules","rules":[{"toolName":"Read","ruleContent":"//tmp/**"}],"behavior":"allow","destination":"session"}` |
+
+#### 4.8.2 permission_response Message Format
+
+After user approval via UI, the system writes to the agent's inbox:
+
+```jsonc
+// Success response (user approved)
+{
+  "type": "permission_response",
+  "request_id": "perm-1770980462304-4uqstf5",
+  "subtype": "success",
+  "response": {
+    "updated_input": { /* original or modified tool parameters */ },
+    "permission_updates": []
+  }
+}
+
+// Rejection response (user denied)
+{
+  "type": "permission_response",
+  "request_id": "perm-1770980484351-5rzn82g",
+  "subtype": "error",
+  "error": "Rejection reason string"
+}
+```
+
+#### 4.8.3 Permission Trigger Matrix (`acceptEdits` mode)
+
+| Tool | Operation | Triggers permission_request |
+|------|-----------|---------------------------|
+| Read | Read file within project directory | No |
+| Bash | mkdir outside project directory | **Yes** |
+| Write | Create file outside project directory | **Yes** |
+| Read | Read file outside project directory | **Yes** |
+
+**Conclusion**: In `acceptEdits` mode, Read within the project directory does not trigger permission requests, but all operations on external directories (including Read) do.
+
+### 4.9 Lead Delegate UI Mode (Verified)
+
+> **Note**: Lead Delegate UI mode and Task tool's `mode="delegate"` parameter are two independent concepts. The former is a Lead UI mode toggle; the latter is a teammate permission mode.
+
+#### 4.9.1 Definition
+
+Delegate mode is a **Team Lead UI mode**, toggled by pressing Tab in the Claude Code UI. It is purely a UI-layer behavior — config.json and CLI parameters contain no delegate markers.
+
+#### 4.9.2 Implementation
+
+On entering delegate mode, the system injects constraints via `system-reminder` (re-injected after each tool call):
+
+```
+## Delegate Mode
+
+You are in delegate mode for team "{team_name}". In this mode, you can ONLY use the following tools:
+- TeammateTool: For spawning teammates, sending messages, and team coordination
+- TaskCreate: For creating new tasks
+- TaskGet: For retrieving task details
+- TaskUpdate: For updating task status and adding comments
+- TaskList: For listing all tasks
+
+You CANNOT use any other tools (Bash, Read, Write, Edit, etc.) until you exit delegate mode.
+```
+
+#### 4.9.3 Available Tools
+
+| Tool | Available | Purpose |
+|------|-----------|---------|
+| TeammateTool (Task/SendMessage) | Yes | Spawn teammates, send messages |
+| TaskCreate / TaskGet / TaskUpdate / TaskList | Yes | Task CRUD |
+| Bash / Read / Write / Edit / Glob / Grep | No | Disabled |
+
+#### 4.9.4 Impact on Teammates
+
+Lead's delegate UI mode **does not affect teammate CLI parameters or permissions**. Teammates spawned in delegate mode (without specifying Task tool `mode`) are identical to those spawned in normal mode.
+
+#### 4.9.5 Known Limitation
+
+After exiting delegate mode, some tools **may not immediately restore**. In testing, Bash and Read still returned `"No such tool available"` while Glob worked. This is likely related to tool list caching in the context.
 
 ---
 
@@ -605,14 +892,16 @@ Actual notifications received by Lead (verified):
   "backendType": "tmux"      // runtime backend
 }
 
-// 2. System confirms termination (from teammate_id="system")
-{
-  "type": "teammate_terminated",
-  "message": "tester-01 has shut down."
-}
+// 2. System confirms termination (NOT via inbox — delivered via conversation turn injection)
+// Lead actually receives a Task tool completion notification in the format:
+// "Task {id} (type: in_process_teammate) (status: completed)"
 ```
 
-**Note**: `teammate_terminated` and `shutdown_approved` arrive nearly simultaneously; order may vary (in testing, `teammate_terminated` arrived slightly before `shutdown_approved`).
+**Notes**:
+- `shutdown_approved` is delivered via inbox file; Lead reads it when consuming inbox
+- `teammate_terminated` is **NOT delivered via inbox files** — it arrives via system-level conversation turn injection
+- Both arrive nearly simultaneously; order may vary
+- After termination, the agent's member entry is **completely removed** from config.json's `members` array
 
 ---
 
@@ -708,6 +997,7 @@ claude --dangerously-skip-permissions
 | `--parent-session-id` | Lead's session ID | Yes |
 | `--agent-type` | Agent type | Yes |
 | `--model` | LLM model | Yes |
+| `--plan-mode-required` | Force agent to start in plan mode | **Conditional**: passed when Task tool `mode="plan"` (independent boolean flag, orthogonal to `--permission-mode`) |
 | `--dangerously-skip-permissions` | Bypass permission checks | **Conditional**: only when Lead uses this mode |
 | `--permission-mode` | Permission mode (6 choices) | **Conditional**: passed when Lead/caller specifies |
 | `--allowedTools` | Tool whitelist | **Conditional**: passed when tool restrictions are configured |
@@ -1111,9 +1401,21 @@ Claude CLI natively supports 6 permission modes, passed via `--permission-mode` 
 | `bypassPermissions` | `--dangerously-skip-permissions` | Bypass all permission checks |
 | `plan` | `--permission-mode plan` | Read-only analysis mode |
 | `dontAsk` | `--permission-mode dontAsk` | Auto-reject uncertain operations |
-| `delegate` | `--permission-mode delegate` | Route permission requests to Lead via inbox protocol |
+| `delegate` | `--permission-mode delegate` | Route permission requests to Lead via inbox protocol (see §4.8) |
 
-> Note: In `delegate` mode, when an Agent attempts a restricted operation, it sends a `permission_request` message via the inbox. The Lead/Controller approves or rejects via `permission_response`. This mode was not tested in live verification.
+> Note: In `delegate` mode (actually mapped to `acceptEdits`), when an Agent attempts a restricted operation, it sends a `permission_request` message via the inbox. The user approves or rejects via UI, and the system generates a `permission_response`. (Verified)
+
+#### Task Tool `mode` Parameter to CLI Mapping (Verified)
+
+| Task tool `mode` | CLI Parameter | config.json Field | Notes |
+|-------------------|--------------|-------------------|-------|
+| `"plan"` | `--plan-mode-required` | `planModeRequired: true` | Independent boolean flag, orthogonal to permission mode |
+| `"delegate"` | `--permission-mode acceptEdits` | **None** (permission mode not recorded in config.json) | Internal mapping, passed only via CLI |
+| `"acceptEdits"` | `--permission-mode acceptEdits` | **None** | Direct mapping |
+| `"bypassPermissions"` | `--dangerously-skip-permissions` | **None** | Direct mapping |
+| Not specified | No `--permission-mode` | **None** | Inherits default behavior |
+
+**Key finding**: Teammate permission mode is **not recorded in config.json**, only passed via CLI parameters. The permission mode cannot be inferred from config.json.
 
 ### 9.5 Tool Whitelist/Blacklist
 
