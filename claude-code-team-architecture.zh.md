@@ -455,6 +455,10 @@ Agent 间通信的核心工具，支持 5 种消息类型：
 4. **Idle 通知**：Agent 每个 turn 结束后自动进入 idle，系统向 Lead 发送 idle 通知（也写入 Lead 的 inbox 文件）
 5. **Peer DM 可见性**：队员之间的 DM 摘要会包含在 idle 通知中，Lead 可见但无需回应
 6. **消息持久化**：已消费的消息不从 inbox 文件中删除，保留完整历史直到 TeamDelete 清理
+7. **字段映射**：SendMessage 参数与 inbox 落盘字段的对应关系因消息类型而异（完整定义见附录 C.1）：
+   - 普通消息 / broadcast：`content` → inbox 外层 `text`（纯文本）
+   - shutdown_request：`content` → inbox 内层 `reason`（非外层 `text`）
+   - shutdown_response：`approve` + `request_id` → 系统生成 `shutdown_approved` 写入 Lead inbox
 
 ### 4.4 Idle 通知格式
 
@@ -523,14 +527,40 @@ Agent 间通信的核心工具，支持 5 种消息类型：
 
 > **注意**：`teammate_terminated` 不通过 inbox 文件投递，而是通过系统级会话注入（conversation turn injection）送达 Lead，格式为：`"Task {id} (type: in_process_teammate) (status: completed)"`。
 
+> **待验证**：`shutdown_response(approve=false)` 场景下 Lead inbox 中是否出现 `shutdown_rejected` 类型消息，V1/V2 均未测试。所有已验证的 shutdown 流程均为 approve=true 路径。
+
+> **命名约定差异**：shutdown / plan 系列消息使用 **camelCase** `requestId`，permission 系列使用 **snake_case** `request_id`，这是协议层面的命名不一致，消费方需注意兼容。
+
 **`read` 字段行为**：
 - 写入时默认 `false`
 - 接收方进程消费消息后，系统更新为 `true`（**写回同一文件**）
 - 已消费的消息**不会被删除**，inbox 文件保留完整消息历史
 
 **`color` 字段**：
-- 仅出现在**非 Lead 发送**的消息中
-- 值为发送方 Agent 在 config.json 中的颜色标识
+- 多数非 Lead 发送的消息外层含 `color`（如 DM、idle_notification、permission_request）
+- 但并非所有非 Lead 消息都含该字段（如 `plan_approval_request` 外层无 `color`）
+- 有 `color` 时，值为发送方 Agent 在 config.json 中的颜色标识
+
+**Inbox 外层可选字段出现矩阵**（`from`, `text`, `timestamp`, `read` 为必选，此处仅列可选字段）：
+
+| 消息来源 / 类型 | `summary` | `color` | 验证来源 |
+|---|---|---|---|
+| 初始 prompt（Lead→Agent） | ✗ | ✗ | V1-S3, V2-B.2 |
+| SendMessage Lead→Agent | ✓ | ✗ | V1-M1 |
+| SendMessage Agent→Lead | ✓ | ✓ | V1-M1r |
+| P2P DM Agent→Agent | ✓ | ✓ | V1-P2P, V2-B.1 |
+| broadcast Lead→All | 待验证 | ✗ | V1-M2（仅验证无 color） |
+| task_assignment（系统） | ✗ | ✗ | V1-M3 |
+| plan_approval_request | ✗ | ✗ | V2-A.3 |
+| permission_request | ✗ | ✓ | V2-C.1.3 |
+| idle_notification | 待验证 | 待验证 | 无外层样本 |
+| shutdown_request / approved | 待验证 | 待验证 | 无外层样本 |
+| plan_approval_response | 待验证 | 待验证 | 无外层样本 |
+| permission_response | 待验证 | 待验证 | 无外层样本 |
+
+> task_assignment 的完整外层示例（V1-M3 实测）：`{"from":"team-lead","text":"{\"type\":\"task_assignment\",...}","timestamp":"2026-02-13T10:10:53.467Z","read":true}`（无 `summary`，无 `color`）。
+
+**内层 body 发送方字段冗余说明**：多种消息类型在内层 body 中也含发送方标识，但命名不统一——idle_notification / shutdown_request / shutdown_approved / plan_approval_request 使用 `from`（与外层同名冗余），task_assignment 使用 `assignedBy`，permission_request 使用 `agent_id`，permission_response 无发送方字段。
 
 **生命周期**：
 - TeamDelete 时，`inboxes/` 目录随 `teams/{name}/` 一起被删除
@@ -859,8 +889,8 @@ Lead 的 delegate UI 模式**不影响 teammate 的 CLI 参数和权限**。在 
 
 1. Lead 发送 `shutdown_request`
 2. Agent 收到请求，可以：
-   - `approve: true` → 进程终止
-   - `approve: false` → 继续工作（附带拒绝原因）
+   - `approve: true` → 进程终止，Lead inbox 收到 `shutdown_approved` 消息
+   - `approve: false` → 继续工作（附带拒绝原因）；**reject 场景的 Lead inbox 消息格式待验证**（V1/V2 均未测试此路径）
 3. 全部 Agent 关闭后，Lead 可调用 `TeamDelete` 清理资源
 
 **关闭协议的完整消息链（已验证）：**
@@ -1453,3 +1483,605 @@ Claude CLI 支持通过以下参数控制 Agent 可用的工具集（`claude --h
 4. **消息节制**：优先使用 `message` 而非 `broadcast`，减少 token 消耗
 5. **优雅关闭**：始终通过 `shutdown_request/response` 协议关闭 Agent
 6. **资源清理**：工作完成后调用 `TeamDelete` 释放资源
+
+---
+
+## 附录 C：完整 Schema 参考
+
+> 本附录汇总所有消息体和文件格式的完整定义，作为自包含的协议参考手册。所有 Schema 均基于 V1（84 项）+ V2（38 项）黑盒验证数据。
+
+### C.1 Inbox 消息完整定义
+
+#### C.1.1 Inbox 文件格式
+
+**路径**：`~/.claude/teams/{team_name}/inboxes/{agentName}.json`
+
+**格式**：JSON 数组，每条消息为一个对象
+
+```jsonc
+[
+  {
+    // === 必选字段 ===
+    "from": "team-lead",                  // string: 发送方名称
+    "text": "消息正文或 JSON 字符串",       // string: 纯文本或 JSON-stringified 消息体
+    "timestamp": "2026-02-13T10:11:35Z",  // string: ISO 8601
+    "read": false,                         // boolean: 消费后由系统更新为 true
+
+    // === 可选字段 ===
+    "summary": "摘要文本",                  // string: SendMessage 的 summary 参数
+    "color": "blue"                        // string: 发送方 Agent 的颜色标识
+  }
+]
+```
+
+**创建时机**：
+- Agent inbox：spawn 时创建（初始 prompt 为第一条消息）
+- Lead inbox：首次收到 Agent 消息时创建
+
+**生命周期**：TeamDelete 时随 `teams/{name}/` 一起删除。已消费消息不删除，保留完整历史。
+
+#### C.1.2 纯文本消息
+
+**触发**：`SendMessage(type="message")` / `SendMessage(type="broadcast")` / Agent spawn 初始 prompt
+
+```jsonc
+// ① 初始 prompt（Lead → Agent，spawn 时自动写入）
+{
+  "from": "team-lead",
+  "text": "你是 analysis-team 的成员 researcher-config...",
+  "timestamp": "2026-02-13T10:05:44.590Z",
+  "read": true
+  // 无 summary，无 color
+}
+
+// ② SendMessage Lead → Agent
+{
+  "from": "team-lead",
+  "text": "这是格式验证消息，请确认收到。",
+  "timestamp": "2026-02-13T10:11:35.247Z",
+  "read": true,
+  "summary": "格式验证测试"
+  // 有 summary，无 color（Lead 无颜色）
+}
+
+// ③ SendMessage Agent → Lead
+{
+  "from": "verifier-01",
+  "text": "Markdown 格式的分析报告...",
+  "timestamp": "2026-02-13T10:10:16.933Z",
+  "read": true,
+  "summary": "返回 config.json 成员条目和 inbox 内容",
+  "color": "blue"
+  // 有 summary，有 color
+}
+
+// ④ P2P DM（Agent → Agent）
+{
+  "from": "alice",
+  "text": "Alice到Bob的P2P测试消息",
+  "summary": "Alice-P2P-DM",
+  "timestamp": "2026-02-13T10:45:20.631Z",
+  "color": "green",
+  "read": true
+  // 有 summary，有 color
+}
+
+// ⑤ broadcast（每个接收方 inbox 中各一条，独立投递）
+{
+  "from": "team-lead",
+  "text": "全体注意：广播测试消息",
+  "timestamp": "2026-02-13T10:11:56.621Z",
+  "read": true
+  // 无 color（Lead 无颜色）；summary 待验证
+}
+```
+
+**字段映射**：SendMessage `content` 参数 → inbox 外层 `text` 字段（纯文本直传）。
+
+#### C.1.3 task_assignment
+
+**触发**：`TaskUpdate(owner=X)` 分配任务 owner 时系统自动生成
+
+**外层**（V1-M3 实测）：
+
+```jsonc
+{
+  "from": "team-lead",
+  "text": "{\"type\":\"task_assignment\",\"taskId\":\"1\",\"subject\":\"验证任务A\",\"description\":\"用于格式验证的测试任务\",\"assignedBy\":\"team-lead\",\"timestamp\":\"2026-02-13T10:10:53.467Z\"}",
+  "timestamp": "2026-02-13T10:10:53.467Z",
+  "read": true
+  // 无 summary，无 color
+}
+```
+
+**内层**（`text` 字段 JSON.parse 后）：
+
+```jsonc
+{
+  "type": "task_assignment",           // string: 固定值
+  "taskId": "1",                       // string: 任务 ID
+  "subject": "验证任务A",              // string: 任务标题
+  "description": "用于格式验证的测试任务", // string: 任务详情
+  "assignedBy": "team-lead",           // string: 分配者名称（非 "from"）
+  "timestamp": "2026-02-13T10:10:53.467Z"  // string: ISO 8601
+}
+```
+
+#### C.1.4 idle_notification
+
+**触发**：Agent 每个 turn 结束后系统自动生成，写入 Lead 的 inbox
+
+**内层**：
+
+```jsonc
+// 基础变体（无 DM 发送时）
+{
+  "type": "idle_notification",           // string: 固定值
+  "from": "verifier-01",                 // string: Agent 名称
+  "timestamp": "2026-02-13T10:10:22.049Z", // string: ISO 8601
+  "idleReason": "available"              // string: 目前仅观察到 "available"
+}
+
+// P2P 变体（Agent 刚向另一 Agent 发送了 DM）
+{
+  "type": "idle_notification",
+  "from": "alice",
+  "timestamp": "2026-02-13T10:45:27.138Z",
+  "idleReason": "available",
+  "summary": "[to bob] Alice-P2P-DM"     // string: 格式 "[to {recipient}] {SendMessage的summary}"
+}
+```
+
+> 注：同一 Agent 可能连续发送多次 idle 通知（2~4 次），属正常行为。`summary` 仅在 P2P DM 后出现。
+
+#### C.1.5 shutdown_request
+
+**触发**：`SendMessage(type="shutdown_request")`
+
+**内层**：
+
+```jsonc
+{
+  "type": "shutdown_request",            // string: 固定值
+  "requestId": "shutdown-1770977603516@verifier-01",  // string: shutdown-{epoch_ms}@{agentName}
+  "from": "team-lead",                   // string: 发送方
+  "reason": "验证完成，请关闭",           // string: 对应 SendMessage 的 content 参数
+  "timestamp": "2026-02-13T10:13:23.516Z" // string: ISO 8601
+}
+```
+
+> **字段映射**：SendMessage `content` → 内层 `reason`（非外层 `text`，与普通消息不同）。
+
+#### C.1.6 shutdown_approved
+
+**触发**：Agent 调用 `SendMessage(type="shutdown_response", approve=true)` 后系统生成
+
+**内层**：
+
+```jsonc
+{
+  "type": "shutdown_approved",           // string: 固定值
+  "requestId": "shutdown-1770977604066@verifier-02",  // string: 与 request 对应
+  "from": "verifier-02",                 // string: Agent 名称
+  "timestamp": "2026-02-13T10:13:29.576Z", // string: ISO 8601
+  "paneId": "%71",                       // string: tmux pane ID
+  "backendType": "tmux"                  // string: "tmux" | "in-process"
+}
+```
+
+> **待验证**：Agent 调用 `shutdown_response(approve=false)` 时 Lead inbox 中是否出现对应消息（如 `shutdown_rejected`），V1/V2 均未覆盖此路径。
+
+#### C.1.7 plan_approval_request
+
+**触发**：`planModeRequired: true` 的 Agent 调用 `ExitPlanMode`
+
+**外层**（V2-A.3 实测）：
+
+```jsonc
+{
+  "from": "planner-01",
+  "text": "<下方 JSON 的字符串化>",
+  "timestamp": "2026-02-13T10:43:07.887Z",
+  "read": true
+  // 无 summary，无 color（与其他 Agent 发送的消息不同）
+}
+```
+
+**内层**：
+
+```jsonc
+{
+  "type": "plan_approval_request",       // string: 固定值
+  "from": "planner-01",                  // string: Agent 名称
+  "timestamp": "2026-02-13T10:43:07.887Z", // string: ISO 8601
+  "planFilePath": "/Users/night/.claude/plans/snug-inventing-popcorn.md",
+                                          // string: plan 文件绝对路径（~/.claude/plans/{random-name}.md）
+  "planContent": "# 计划标题\n\n## 步骤...", // string: 完整 Markdown 计划文本（内联）
+  "requestId": "plan_approval-1770979387887@planner-01@advanced-verify"
+                                          // string: plan_approval-{epoch_ms}@{agentName}@{teamName}
+}
+```
+
+#### C.1.8 plan_approval_response
+
+**触发**：系统自动审批（169~878ms 延迟）/ Lead 手动通过 `SendMessage(type="plan_approval_response")` 发送
+
+**内层（approve=true，系统自动审批）**：
+
+```jsonc
+{
+  "type": "plan_approval_response",      // string: 固定值
+  "requestId": "plan_approval-1770979387887@planner-01@advanced-verify",
+                                          // string: 与 request 对应
+  "approved": true,                       // boolean
+  "timestamp": "2026-02-13T10:43:07.980Z", // string: ISO 8601
+  "permissionMode": "acceptEdits"         // string: 继承 Lead 当前权限模式（"default"|"acceptEdits" 等）
+}
+```
+
+**内层（approve=false，reject）**：
+
+```jsonc
+{
+  "type": "plan_approval_response",
+  "requestId": "plan_approval-1770985126334@planner-reject@plan-reject-verify",
+  "approved": false,
+  "feedback": "计划需要补充：请增加对子目录中 .md 文件的扫描，不要仅限于根目录。",
+                                          // string: 拒绝原因
+  "timestamp": "2026-02-13T12:19:03.344Z"
+  // 无 permissionMode
+}
+```
+
+**条件字段对比**：
+
+| 字段 | `approved: true` | `approved: false` |
+|---|---|---|
+| `permissionMode` | ✓（继承 Lead 模式） | ✗ |
+| `feedback` | ✗ | ✓（拒绝原因字符串） |
+
+#### C.1.9 permission_request
+
+**触发**：`--permission-mode acceptEdits`（Task tool `mode="delegate"` 映射）的 Agent 执行项目目录外操作
+
+**外层**（V2-C.1.3 实测）：
+
+```jsonc
+{
+  "from": "delegate-agent",
+  "text": "<下方 JSON 的字符串化>",
+  "timestamp": "2026-02-13T11:01:02.304Z",
+  "color": "purple",                     // 有 color（与 plan_approval_request 不同）
+  "read": true
+  // 无 summary
+}
+```
+
+**内层**：
+
+```jsonc
+{
+  "type": "permission_request",          // string: 固定值
+  "request_id": "perm-1770980462304-4uqstf5",
+                                          // string: perm-{epoch_ms}-{random_7char}（注意: snake_case）
+  "agent_id": "delegate-agent",           // string: 不含 @team 后缀
+  "tool_name": "Bash",                    // string: 请求使用的工具名
+  "tool_use_id": "toolu_01ABC...",        // string: Anthropic API tool_use ID
+  "description": "Create directory /tmp/delegate-test",
+                                          // string: 工具调用描述
+  "input": {                              // object: 完整工具调用参数
+    "command": "mkdir -p /tmp/delegate-test"
+  },
+  "permission_suggestions": [             // array: 建议的权限授予方式（0~N 项）
+    {
+      "type": "addDirectories",           // "addDirectories" | "setMode" | "addRules"
+      "directories": ["/tmp", "/tmp/delegate-test"],
+      "destination": "session"
+    }
+  ]
+}
+```
+
+**`permission_suggestions` 三种类型**：
+
+| `type` | 专有字段 | 说明 |
+|---|---|---|
+| `addDirectories` | `directories: string[]`, `destination: string` | 添加目录白名单 |
+| `setMode` | `mode: string`, `destination: string` | 设置权限模式 |
+| `addRules` | `rules: [{toolName, ruleContent}]`, `behavior: string`, `destination: string` | 添加工具规则 |
+
+#### C.1.10 permission_response
+
+**触发**：用户通过 UI 审批或拒绝 permission_request
+
+**内层（success，用户批准）**：
+
+```jsonc
+{
+  "type": "permission_response",         // string: 固定值
+  "request_id": "perm-1770980462304-4uqstf5",
+                                          // string: 与 request 对应（snake_case）
+  "subtype": "success",                   // string: "success" | "error"
+  "response": {
+    "updated_input": {                    // object: 原始或修改后的工具参数（Lead 可在 UI 中修改）
+      "command": "mkdir -p /tmp/delegate-test"
+    },
+    "permission_updates": []              // array: 权限更新（目前观察均为空数组）
+  }
+}
+```
+
+**内层（error，用户拒绝）**：
+
+```jsonc
+{
+  "type": "permission_response",
+  "request_id": "perm-1770980484351-5rzn82g",
+  "subtype": "error",
+  "error": "拒绝原因字符串"               // string: 人类可读的拒绝理由
+}
+```
+
+**条件字段对比**：
+
+| 字段 | `subtype: "success"` | `subtype: "error"` |
+|---|---|---|
+| `response` | ✓（含 `updated_input` + `permission_updates`） | ✗ |
+| `error` | ✗ | ✓（拒绝原因字符串） |
+
+#### C.1.11 teammate_terminated（非 Inbox 投递）
+
+**投递方式**：系统级会话注入（conversation turn injection），**不经过 inbox 文件**
+
+**格式**：纯文本字符串
+```
+Task {id} (type: in_process_teammate) (status: completed)
+```
+
+---
+
+### C.2 SendMessage 响应格式
+
+#### C.2.1 message 响应
+
+```jsonc
+{
+  "success": true,
+  "message": "Message sent to {name}'s inbox",        // string: 描述文本
+  "routing": {
+    "sender": "team-lead",                             // string: 发送方名称
+    "target": "@verifier-01",                          // string: "@" + 接收方名称
+    "targetColor": "blue",                             // string: 接收方颜色
+    "summary": "格式验证测试",                          // string: SendMessage summary 参数
+    "content": "这是格式验证消息，请确认收到。"          // string: SendMessage content 参数
+  }
+}
+```
+
+#### C.2.2 broadcast 响应
+
+```jsonc
+{
+  "success": true,
+  "message": "Message broadcast to 2 teammate(s): verifier-01, verifier-02",
+  "recipients": ["verifier-01", "verifier-02"],        // string[]: 实际接收者列表
+  "routing": {
+    "sender": "team-lead",
+    "target": "@team",                                 // string: 固定值 "@team"
+    "summary": "广播测试",
+    "content": "全体注意：广播测试消息"
+    // 无 targetColor（广播无单一目标色）
+  }
+}
+```
+
+#### C.2.3 shutdown_request 响应
+
+```jsonc
+{
+  "success": true,
+  "message": "Shutdown request sent to verifier-01. Request ID: shutdown-1770977603516@verifier-01",
+  "request_id": "shutdown-1770977603516@verifier-01",  // string: shutdown-{epoch_ms}@{agentName}
+  "target": "verifier-01"                              // string: 接收方名称
+}
+```
+
+#### C.2.4 三种响应格式对比
+
+| 字段 | `message` | `broadcast` | `shutdown_request` |
+|---|---|---|---|
+| `routing` | ✓ | ✓ | ✗ |
+| `routing.target` | `"@{name}"` | `"@team"` | — |
+| `routing.targetColor` | ✓ | ✗ | — |
+| `recipients` | ✗ | ✓（数组） | ✗ |
+| `request_id` | ✗ | ✗ | ✓ |
+| `target` | ✗ | ✗ | ✓ |
+
+---
+
+### C.3 config.json 完整 Schema
+
+**路径**：`~/.claude/teams/{team_name}/config.json`
+
+```jsonc
+{
+  // === 顶层字段（5 个） ===
+  "name": "analysis-team",                // string: 团队名称（唯一标识）
+  "description": "团队描述",               // string: 用途说明
+  "createdAt": 1770535107409,             // number: Unix 毫秒时间戳
+  "leadAgentId": "team-lead@analysis-team", // string: "{name}@{team}" 格式
+  "leadSessionId": "c93b690c-...",        // string: Lead 的会话 UUID
+
+  // === 成员列表 ===
+  "members": [
+    // --- Team Lead（8 个字段） ---
+    {
+      "agentId": "team-lead@analysis-team",  // string: {name}@{team}
+      "name": "team-lead",                   // string: 通信标识
+      "agentType": "team-lead",              // string: 固定值
+      "model": "claude-opus-4-6",            // string: 模型 ID
+      "joinedAt": 1770535107409,             // number: Unix 毫秒时间戳
+      "tmuxPaneId": "",                      // string: Lead 为空字符串
+      "cwd": "/path/to/project",             // string: 工作目录
+      "subscriptions": []                    // array: 预留字段（运行时无效果）
+    },
+
+    // --- Teammate（13 个字段） ---
+    {
+      "agentId": "researcher-01@analysis-team", // string: {name}@{team}
+      "name": "researcher-01",               // string: SendMessage recipient 使用此名称
+      "agentType": "general-purpose",        // string: "general-purpose"|"Explore"|"Plan"|"Bash"
+      "model": "claude-opus-4-6",            // string: 模型 ID
+      "prompt": "你是 analysis-team 的成员...", // string: 初始指令（Lead 无此字段）
+      "color": "blue",                       // string: UI 颜色标识（Lead 无此字段）
+      "planModeRequired": false,             // boolean: 默认 false（Lead 无此字段）
+      "joinedAt": 1770535144590,             // number: Unix 毫秒时间戳
+      "tmuxPaneId": "%14",                   // string: tmux pane ID（Lead 无此字段实质值）
+      "cwd": "/path/to/project",             // string: 工作目录
+      "subscriptions": [],                   // array: 预留字段
+      "backendType": "tmux",                 // string: "tmux"|"in-process"（Lead 无此字段）
+      "isActive": true                       // boolean: 活跃 true / idle false（Lead 无此字段）
+    }
+  ]
+}
+```
+
+**Lead vs Teammate 字段对比**：
+
+| 字段 | Lead (8) | Teammate (13) | 说明 |
+|---|---|---|---|
+| `agentId` | ✓ | ✓ | 共有 |
+| `name` | ✓ | ✓ | 共有 |
+| `agentType` | ✓ (`"team-lead"`) | ✓ (`"general-purpose"` 等) | 共有 |
+| `model` | ✓ | ✓ | 共有 |
+| `joinedAt` | ✓ | ✓ | 共有 |
+| `tmuxPaneId` | ✓ (`""`) | ✓ (`"%14"` 等) | 共有（Lead 为空串） |
+| `cwd` | ✓ | ✓ | 共有 |
+| `subscriptions` | ✓ (`[]`) | ✓ (`[]`) | 共有（预留字段） |
+| `prompt` | ✗ | ✓ | Teammate 专有 |
+| `color` | ✗ | ✓ | Teammate 专有 |
+| `planModeRequired` | ✗ | ✓ | Teammate 专有（默认 `false`） |
+| `backendType` | ✗ | ✓ | Teammate 专有 |
+| `isActive` | ✗ | ✓ | Teammate 专有 |
+
+**成员生命周期**：Agent 终止后，其条目从 `members` 数组中**完全移除**（非标记为 inactive）。
+
+---
+
+### C.4 Task 文件完整 Schema
+
+**路径**：`~/.claude/tasks/{team_name}/{id}.json`
+
+```jsonc
+{
+  "id": "1",                              // string: 自增 ID
+  "subject": "分析配置文件结构",           // string: 任务标题（祈使句式）
+  "description": "详细描述...",            // string: 任务详情和验收标准
+  "activeForm": "分析配置文件结构中",      // string: 进行中的显示文本（现在进行时）
+  "status": "pending",                    // string: "pending"|"in_progress"|"completed"|"deleted"
+  "owner": "researcher-01",              // string|undefined: 负责人名称（新建时不存在）
+  "blocks": ["4"],                        // string[]: 本任务阻塞的下游任务 ID
+  "blockedBy": [],                        // string[]: 阻塞本任务的上游任务 ID
+  "metadata": {}                          // object|undefined: 附加元数据（新建时不存在）
+}
+```
+
+**状态机**：`pending` → `in_progress` → `completed`（`deleted` 为终态，可从任意状态进入）
+
+**依赖关系**：`blocks` / `blockedBy` 为系统自动维护的双向引用（设置一方时另一方自动更新）。
+
+**并发控制**：同目录下 `.lock` 文件（0 字节），用于文件系统级锁。
+
+---
+
+### C.5 Agent CLI 参数完整列表
+
+```bash
+/Users/night/.local/share/claude/versions/{version} \
+  --agent-id {name}@{team}             \  # 全局唯一 ID（必选）
+  --agent-name {name}                  \  # 人类可读名称（必选）
+  --team-name {team}                   \  # 所属团队（必选）
+  --agent-color {color}                \  # UI 颜色（必选）
+  --parent-session-id {uuid}           \  # Lead 会话 ID（必选）
+  --agent-type {type}                  \  # Agent 类型（必选）
+  --model {model_id}                   \  # LLM 模型（必选）
+  --plan-mode-required                 \  # 条件性：Task mode="plan" 时传递（独立布尔标志）
+  --dangerously-skip-permissions       \  # 条件性：Lead 使用该模式时继承
+  --permission-mode {mode}             \  # 条件性：Task mode="delegate" → "acceptEdits"
+  --allowedTools "..."                 \  # 条件性：工具白名单
+  --disallowedTools "..."                 # 条件性：工具黑名单
+```
+
+**Task tool `mode` 参数与 CLI 参数的映射**：
+
+| Task tool `mode` | CLI 参数 | config.json 字段 |
+|---|---|---|
+| `"plan"` | `--plan-mode-required` | `planModeRequired: true` |
+| `"delegate"` | `--permission-mode acceptEdits` | 无（不记录在 config.json） |
+| `"acceptEdits"` | `--permission-mode acceptEdits` | 无 |
+| `"bypassPermissions"` | `--dangerously-skip-permissions` | 无 |
+| 未指定 | 无 `--permission-mode` | 无 |
+
+---
+
+### C.6 requestId 命名约定与格式
+
+| 消息类型 | ID 字段名 | 格式模板 | 命名风格 |
+|---|---|---|---|
+| shutdown_request | `requestId` | `shutdown-{epoch_ms}@{agentName}` | camelCase |
+| shutdown_approved | `requestId` | 同 request | camelCase |
+| plan_approval_request | `requestId` | `plan_approval-{epoch_ms}@{agentName}@{teamName}` | camelCase |
+| plan_approval_response | `requestId` | 同 request | camelCase |
+| permission_request | `request_id` | `perm-{epoch_ms}-{random_7char}` | **snake_case** |
+| permission_response | `request_id` | 同 request | **snake_case** |
+
+> shutdown/plan 系列使用 camelCase `requestId`，permission 系列使用 snake_case `request_id`，属协议层面的命名不一致。
+
+---
+
+### C.7 关键目录与文件结构
+
+```
+~/.claude/
+├── teams/{team_name}/
+│   ├── config.json                    # 团队配置（见 C.3）
+│   └── inboxes/
+│       ├── team-lead.json             # Lead inbox（见 C.1）
+│       └── {agentName}.json           # Agent inbox（见 C.1）
+│
+├── tasks/{team_name}/
+│   ├── .lock                          # 并发锁（0 字节）
+│   └── {id}.json                      # 任务文件（见 C.4）
+│
+├── plans/
+│   └── {random-name}.md               # Plan Mode 计划文件
+│
+├── shell-snapshots/
+│   └── snapshot-zsh-{ts}-{id}.sh      # Shell 环境快照
+│
+├── session-env/{session-uuid}/         # 会话环境
+├── debug/{session-uuid}.txt            # 调试日志（latest 符号链接指向最新）
+│
+├── projects/{project-path}/
+│   └── {session-id}.jsonl             # 对话历史（JSONL 格式）
+│
+└── /tmp/claude-{uid}/{project-path-escaped}/
+    └── tasks/{hash}.output            # Task 子任务中间输出
+```
+
+---
+
+### C.8 消息类型速查总表
+
+| 消息类型 | `text` 格式 | 触发来源 | 投递方式 | 内层字段数 |
+|---|---|---|---|---|
+| 普通消息 | 纯文本 | `SendMessage(message/broadcast)` | inbox 文件 | — |
+| `task_assignment` | JSON | `TaskUpdate(owner=X)` | inbox 文件 | 6 |
+| `idle_notification` | JSON | Agent turn 结束（系统） | inbox 文件 | 4~5 |
+| `shutdown_request` | JSON | `SendMessage(shutdown_request)` | inbox 文件 | 5 |
+| `shutdown_approved` | JSON | Agent approve 关闭 | inbox 文件 | 6 |
+| `plan_approval_request` | JSON | Agent `ExitPlanMode` | inbox 文件 | 6 |
+| `plan_approval_response` | JSON | 系统自动审批 / Lead 手动 | inbox 文件 | 4~5 |
+| `permission_request` | JSON | Agent 执行受限操作 | inbox 文件 | 8 |
+| `permission_response` | JSON | 用户 UI 审批 | inbox 文件 | 3~4 |
+| `teammate_terminated` | — | 进程终止（系统） | **会话注入**（非 inbox） | — |

@@ -453,6 +453,10 @@ Sender Agent                    System                      Receiver Agent
 4. **Idle notifications**: Agents auto-enter idle after each turn; system sends idle notification to Lead (also written to Lead's inbox file)
 5. **Peer DM visibility**: DM summaries between teammates are included in idle notifications, visible to Lead
 6. **Message retention**: Consumed messages are NOT removed from the inbox file; full history is preserved until TeamDelete
+7. **Field mapping**: The mapping between SendMessage parameters and inbox persisted fields varies by message type (see Appendix C.1 for full definitions):
+   - Regular message / broadcast: `content` → inbox outer `text` (plain text)
+   - shutdown_request: `content` → inbox inner `reason` (NOT the outer `text`)
+   - shutdown_response: `approve` + `request_id` → system generates `shutdown_approved` into Lead inbox
 
 ### 4.4 Idle Notification Format (Verified)
 
@@ -519,14 +523,40 @@ Sender Agent                    System                      Receiver Agent
 
 > **Note**: `teammate_terminated` is NOT delivered via inbox files. It is delivered via system-level conversation turn injection to the Lead, in the format: `"Task {id} (type: in_process_teammate) (status: completed)"`.
 
+> **Unverified**: Whether a `shutdown_rejected` message type appears in the Lead inbox when an agent calls `shutdown_response(approve=false)` is unknown. All verified shutdown flows followed the approve=true path (V1/V2 did not test this scenario).
+
+> **Naming convention inconsistency**: The shutdown/plan message families use **camelCase** `requestId`, while the permission family uses **snake_case** `request_id`. This is a protocol-level naming inconsistency; consumers should handle both conventions.
+
 **`read` field behavior**:
 - Defaults to `false` on write
 - Updated to `true` after receiver process consumes the message (**written back to the same file**)
 - Consumed messages are **never deleted**; inbox file retains full message history
 
 **`color` field**:
-- Only present on messages sent by **non-Lead** agents
-- Value is the sender agent's color identifier from config.json
+- Present in most messages sent by non-Lead agents (e.g. DMs, idle_notification, permission_request)
+- However, not ALL non-Lead messages include this field (e.g. `plan_approval_request` outer wrapper has no `color`)
+- When present, the value is the sender agent's color identifier from config.json
+
+**Inbox outer optional field matrix** (`from`, `text`, `timestamp`, `read` are required; only optional fields listed):
+
+| Message source / type | `summary` | `color` | Verification source |
+|---|---|---|---|
+| Initial prompt (Lead→Agent) | No | No | V1-S3, V2-B.2 |
+| SendMessage Lead→Agent | Yes | No | V1-M1 |
+| SendMessage Agent→Lead | Yes | Yes | V1-M1r |
+| P2P DM Agent→Agent | Yes | Yes | V1-P2P, V2-B.1 |
+| broadcast Lead→All | Unverified | No | V1-M2 (only verified no color) |
+| task_assignment (system) | No | No | V1-M3 |
+| plan_approval_request | No | No | V2-A.3 |
+| permission_request | No | Yes | V2-C.1.3 |
+| idle_notification | Unverified | Unverified | No outer wrapper sample |
+| shutdown_request / approved | Unverified | Unverified | No outer wrapper sample |
+| plan_approval_response | Unverified | Unverified | No outer wrapper sample |
+| permission_response | Unverified | Unverified | No outer wrapper sample |
+
+> task_assignment full outer wrapper example (V1-M3 actual): `{"from":"team-lead","text":"{\"type\":\"task_assignment\",...}","timestamp":"2026-02-13T10:10:53.467Z","read":true}` (no `summary`, no `color`).
+
+**Inner body sender field redundancy**: Multiple message types include a sender identifier in the inner body with inconsistent naming — idle_notification / shutdown_request / shutdown_approved / plan_approval_request use `from` (redundant with outer wrapper), task_assignment uses `assignedBy`, permission_request uses `agent_id`, permission_response has no sender field.
 
 **Lifecycle**:
 - On TeamDelete, the `inboxes/` directory is deleted along with `teams/{name}/`
@@ -856,8 +886,8 @@ After exiting delegate mode, some tools **may not immediately restore**. In test
 
 1. Lead sends `shutdown_request`
 2. Agent receives request and can:
-   - `approve: true` → Process terminates
-   - `approve: false` → Continue working (with rejection reason)
+   - `approve: true` → Process terminates; Lead inbox receives `shutdown_approved` message
+   - `approve: false` → Continue working (with rejection reason); **reject scenario Lead inbox message format is unverified** (V1/V2 did not test this path)
 3. After all agents shut down, Lead can call `TeamDelete` to clean up
 
 **Complete shutdown message chain (verified):**
@@ -1452,3 +1482,605 @@ These parameters provide more granular tool access control than `agentType` alon
 4. **Message discipline**: Prefer `message` over `broadcast` to reduce token consumption
 5. **Graceful shutdown**: Always use `shutdown_request/response` protocol to close agents
 6. **Resource cleanup**: Call `TeamDelete` after work is complete to release resources
+
+---
+
+## Appendix C: Complete Schema Reference
+
+> This appendix consolidates all message body and file format definitions as a self-contained protocol reference. All schemas are based on V1 (84 items) + V2 (38 items) black-box verification data.
+
+### C.1 Inbox Message Definitions
+
+#### C.1.1 Inbox File Format
+
+**Path**: `~/.claude/teams/{team_name}/inboxes/{agentName}.json`
+
+**Format**: JSON array, each message is an object
+
+```jsonc
+[
+  {
+    // === Required fields ===
+    "from": "team-lead",                  // string: sender name
+    "text": "Message body or JSON string", // string: plain text or JSON-stringified message body
+    "timestamp": "2026-02-13T10:11:35Z",  // string: ISO 8601
+    "read": false,                         // boolean: updated to true by system after consumption
+
+    // === Optional fields ===
+    "summary": "Summary text",             // string: SendMessage summary parameter
+    "color": "blue"                        // string: sender agent's color identifier
+  }
+]
+```
+
+**Creation timing**:
+- Agent inbox: Created on spawn (initial prompt is the first message)
+- Lead inbox: Created on first message received from an agent
+
+**Lifecycle**: Deleted along with `teams/{name}/` on TeamDelete. Consumed messages are never deleted; full history is retained.
+
+#### C.1.2 Plain Text Messages
+
+**Trigger**: `SendMessage(type="message")` / `SendMessage(type="broadcast")` / Agent spawn initial prompt
+
+```jsonc
+// ① Initial prompt (Lead → Agent, auto-written on spawn)
+{
+  "from": "team-lead",
+  "text": "You are a member of analysis-team named researcher-config...",
+  "timestamp": "2026-02-13T10:05:44.590Z",
+  "read": true
+  // No summary, no color
+}
+
+// ② SendMessage Lead → Agent
+{
+  "from": "team-lead",
+  "text": "This is a format verification message, please confirm receipt.",
+  "timestamp": "2026-02-13T10:11:35.247Z",
+  "read": true,
+  "summary": "Format verification test"
+  // Has summary, no color (Lead has no color)
+}
+
+// ③ SendMessage Agent → Lead
+{
+  "from": "verifier-01",
+  "text": "Markdown analysis report...",
+  "timestamp": "2026-02-13T10:10:16.933Z",
+  "read": true,
+  "summary": "Return config.json member entries and inbox contents",
+  "color": "blue"
+  // Has summary, has color
+}
+
+// ④ P2P DM (Agent → Agent)
+{
+  "from": "alice",
+  "text": "Alice to Bob P2P test message",
+  "summary": "Alice-P2P-DM",
+  "timestamp": "2026-02-13T10:45:20.631Z",
+  "color": "green",
+  "read": true
+  // Has summary, has color
+}
+
+// ⑤ broadcast (one entry per receiver inbox, independently delivered)
+{
+  "from": "team-lead",
+  "text": "Attention all: broadcast test message",
+  "timestamp": "2026-02-13T10:11:56.621Z",
+  "read": true
+  // No color (Lead has no color); summary unverified
+}
+```
+
+**Field mapping**: SendMessage `content` parameter → inbox outer `text` field (plain text passthrough).
+
+#### C.1.3 task_assignment
+
+**Trigger**: `TaskUpdate(owner=X)` — system auto-generates when task owner is assigned
+
+**Outer wrapper** (V1-M3 actual):
+
+```jsonc
+{
+  "from": "team-lead",
+  "text": "{\"type\":\"task_assignment\",\"taskId\":\"1\",\"subject\":\"Verify task A\",\"description\":\"Test task for format verification\",\"assignedBy\":\"team-lead\",\"timestamp\":\"2026-02-13T10:10:53.467Z\"}",
+  "timestamp": "2026-02-13T10:10:53.467Z",
+  "read": true
+  // No summary, no color
+}
+```
+
+**Inner body** (`text` field after JSON.parse):
+
+```jsonc
+{
+  "type": "task_assignment",           // string: fixed value
+  "taskId": "1",                       // string: task ID
+  "subject": "Verify task A",          // string: task title
+  "description": "Test task for format verification", // string: task details
+  "assignedBy": "team-lead",           // string: assigner name (NOT "from")
+  "timestamp": "2026-02-13T10:10:53.467Z"  // string: ISO 8601
+}
+```
+
+#### C.1.4 idle_notification
+
+**Trigger**: System auto-generates after each agent turn ends; written to Lead's inbox
+
+**Inner body**:
+
+```jsonc
+// Basic variant (no DM sent)
+{
+  "type": "idle_notification",           // string: fixed value
+  "from": "verifier-01",                 // string: agent name
+  "timestamp": "2026-02-13T10:10:22.049Z", // string: ISO 8601
+  "idleReason": "available"              // string: only "available" observed so far
+}
+
+// P2P variant (agent just sent a DM to another agent)
+{
+  "type": "idle_notification",
+  "from": "alice",
+  "timestamp": "2026-02-13T10:45:27.138Z",
+  "idleReason": "available",
+  "summary": "[to bob] Alice-P2P-DM"     // string: format "[to {recipient}] {SendMessage summary}"
+}
+```
+
+> Note: The same agent may send multiple consecutive idle notifications (2–4 times); this is normal behavior. `summary` only appears after the agent sent a P2P DM.
+
+#### C.1.5 shutdown_request
+
+**Trigger**: `SendMessage(type="shutdown_request")`
+
+**Inner body**:
+
+```jsonc
+{
+  "type": "shutdown_request",            // string: fixed value
+  "requestId": "shutdown-1770977603516@verifier-01",  // string: shutdown-{epoch_ms}@{agentName}
+  "from": "team-lead",                   // string: sender
+  "reason": "Verification complete, please shut down", // string: maps from SendMessage content
+  "timestamp": "2026-02-13T10:13:23.516Z" // string: ISO 8601
+}
+```
+
+> **Field mapping**: SendMessage `content` → inner body `reason` (NOT the outer `text` — differs from regular messages).
+
+#### C.1.6 shutdown_approved
+
+**Trigger**: Agent calls `SendMessage(type="shutdown_response", approve=true)`, system generates this
+
+**Inner body**:
+
+```jsonc
+{
+  "type": "shutdown_approved",           // string: fixed value
+  "requestId": "shutdown-1770977604066@verifier-02",  // string: matches request
+  "from": "verifier-02",                 // string: agent name
+  "timestamp": "2026-02-13T10:13:29.576Z", // string: ISO 8601
+  "paneId": "%71",                       // string: tmux pane ID
+  "backendType": "tmux"                  // string: "tmux" | "in-process"
+}
+```
+
+> **Unverified**: Whether the Lead inbox receives a corresponding message (e.g. `shutdown_rejected`) when an agent calls `shutdown_response(approve=false)` — V1/V2 did not cover this path.
+
+#### C.1.7 plan_approval_request
+
+**Trigger**: Agent with `planModeRequired: true` calls `ExitPlanMode`
+
+**Outer wrapper** (V2-A.3 actual):
+
+```jsonc
+{
+  "from": "planner-01",
+  "text": "<JSON-stringified body below>",
+  "timestamp": "2026-02-13T10:43:07.887Z",
+  "read": true
+  // No summary, no color (differs from other agent-sent messages)
+}
+```
+
+**Inner body**:
+
+```jsonc
+{
+  "type": "plan_approval_request",       // string: fixed value
+  "from": "planner-01",                  // string: agent name
+  "timestamp": "2026-02-13T10:43:07.887Z", // string: ISO 8601
+  "planFilePath": "/Users/night/.claude/plans/snug-inventing-popcorn.md",
+                                          // string: plan file absolute path (~/.claude/plans/{random-name}.md)
+  "planContent": "# Plan Title\n\n## Steps...", // string: full Markdown plan text (inline)
+  "requestId": "plan_approval-1770979387887@planner-01@advanced-verify"
+                                          // string: plan_approval-{epoch_ms}@{agentName}@{teamName}
+}
+```
+
+#### C.1.8 plan_approval_response
+
+**Trigger**: System auto-approval (169–878ms delay) / Lead manual via `SendMessage(type="plan_approval_response")`
+
+**Inner body (approve=true, system auto-approval)**:
+
+```jsonc
+{
+  "type": "plan_approval_response",      // string: fixed value
+  "requestId": "plan_approval-1770979387887@planner-01@advanced-verify",
+                                          // string: matches request
+  "approved": true,                       // boolean
+  "timestamp": "2026-02-13T10:43:07.980Z", // string: ISO 8601
+  "permissionMode": "acceptEdits"         // string: inherits Lead's current permission mode ("default"|"acceptEdits" etc.)
+}
+```
+
+**Inner body (approve=false, reject)**:
+
+```jsonc
+{
+  "type": "plan_approval_response",
+  "requestId": "plan_approval-1770985126334@planner-reject@plan-reject-verify",
+  "approved": false,
+  "feedback": "Plan needs additions: please add scanning of subdirectories, not just root.",
+                                          // string: rejection reason
+  "timestamp": "2026-02-13T12:19:03.344Z"
+  // No permissionMode
+}
+```
+
+**Conditional field comparison**:
+
+| Field | `approved: true` | `approved: false` |
+|---|---|---|
+| `permissionMode` | Present (inherits Lead mode) | Absent |
+| `feedback` | Absent | Present (rejection reason string) |
+
+#### C.1.9 permission_request
+
+**Trigger**: Agent with `--permission-mode acceptEdits` (Task tool `mode="delegate"` mapping) performs operation outside project directory
+
+**Outer wrapper** (V2-C.1.3 actual):
+
+```jsonc
+{
+  "from": "delegate-agent",
+  "text": "<JSON-stringified body below>",
+  "timestamp": "2026-02-13T11:01:02.304Z",
+  "color": "purple",                     // Has color (differs from plan_approval_request)
+  "read": true
+  // No summary
+}
+```
+
+**Inner body**:
+
+```jsonc
+{
+  "type": "permission_request",          // string: fixed value
+  "request_id": "perm-1770980462304-4uqstf5",
+                                          // string: perm-{epoch_ms}-{random_7char} (NOTE: snake_case)
+  "agent_id": "delegate-agent",           // string: without @team suffix
+  "tool_name": "Bash",                    // string: requested tool name
+  "tool_use_id": "toolu_01ABC...",        // string: Anthropic API tool_use ID
+  "description": "Create directory /tmp/delegate-test",
+                                          // string: tool call description
+  "input": {                              // object: full tool call parameters
+    "command": "mkdir -p /tmp/delegate-test"
+  },
+  "permission_suggestions": [             // array: suggested permission grants (0–N items)
+    {
+      "type": "addDirectories",           // "addDirectories" | "setMode" | "addRules"
+      "directories": ["/tmp", "/tmp/delegate-test"],
+      "destination": "session"
+    }
+  ]
+}
+```
+
+**Three types of `permission_suggestions`**:
+
+| `type` | Type-specific fields | Description |
+|---|---|---|
+| `addDirectories` | `directories: string[]`, `destination: string` | Add directory whitelist |
+| `setMode` | `mode: string`, `destination: string` | Set permission mode |
+| `addRules` | `rules: [{toolName, ruleContent}]`, `behavior: string`, `destination: string` | Add tool rules |
+
+#### C.1.10 permission_response
+
+**Trigger**: User approves or rejects via UI
+
+**Inner body (success, user approved)**:
+
+```jsonc
+{
+  "type": "permission_response",         // string: fixed value
+  "request_id": "perm-1770980462304-4uqstf5",
+                                          // string: matches request (snake_case)
+  "subtype": "success",                   // string: "success" | "error"
+  "response": {
+    "updated_input": {                    // object: original or modified tool parameters (Lead can modify in UI)
+      "command": "mkdir -p /tmp/delegate-test"
+    },
+    "permission_updates": []              // array: permission updates (always empty array in observations)
+  }
+}
+```
+
+**Inner body (error, user rejected)**:
+
+```jsonc
+{
+  "type": "permission_response",
+  "request_id": "perm-1770980484351-5rzn82g",
+  "subtype": "error",
+  "error": "Rejection reason string"      // string: human-readable rejection reason
+}
+```
+
+**Conditional field comparison**:
+
+| Field | `subtype: "success"` | `subtype: "error"` |
+|---|---|---|
+| `response` | Present (`updated_input` + `permission_updates`) | Absent |
+| `error` | Absent | Present (rejection reason string) |
+
+#### C.1.11 teammate_terminated (NOT via Inbox)
+
+**Delivery method**: System-level conversation turn injection, **does NOT go through inbox files**
+
+**Format**: Plain text string
+```
+Task {id} (type: in_process_teammate) (status: completed)
+```
+
+---
+
+### C.2 SendMessage Response Formats
+
+#### C.2.1 message Response
+
+```jsonc
+{
+  "success": true,
+  "message": "Message sent to {name}'s inbox",        // string: description
+  "routing": {
+    "sender": "team-lead",                             // string: sender name
+    "target": "@verifier-01",                          // string: "@" + recipient name
+    "targetColor": "blue",                             // string: recipient's color
+    "summary": "Format verification test",             // string: SendMessage summary parameter
+    "content": "This is a format verification message..." // string: SendMessage content parameter
+  }
+}
+```
+
+#### C.2.2 broadcast Response
+
+```jsonc
+{
+  "success": true,
+  "message": "Message broadcast to 2 teammate(s): verifier-01, verifier-02",
+  "recipients": ["verifier-01", "verifier-02"],        // string[]: actual recipient list
+  "routing": {
+    "sender": "team-lead",
+    "target": "@team",                                 // string: fixed value "@team"
+    "summary": "Broadcast test",
+    "content": "Attention all: broadcast test message"
+    // No targetColor (broadcast has no single target color)
+  }
+}
+```
+
+#### C.2.3 shutdown_request Response
+
+```jsonc
+{
+  "success": true,
+  "message": "Shutdown request sent to verifier-01. Request ID: shutdown-1770977603516@verifier-01",
+  "request_id": "shutdown-1770977603516@verifier-01",  // string: shutdown-{epoch_ms}@{agentName}
+  "target": "verifier-01"                              // string: recipient name
+}
+```
+
+#### C.2.4 Response Format Comparison
+
+| Field | `message` | `broadcast` | `shutdown_request` |
+|---|---|---|---|
+| `routing` | Present | Present | Absent |
+| `routing.target` | `"@{name}"` | `"@team"` | — |
+| `routing.targetColor` | Present | Absent | — |
+| `recipients` | Absent | Present (array) | Absent |
+| `request_id` | Absent | Absent | Present |
+| `target` | Absent | Absent | Present |
+
+---
+
+### C.3 config.json Complete Schema
+
+**Path**: `~/.claude/teams/{team_name}/config.json`
+
+```jsonc
+{
+  // === Top-level fields (5) ===
+  "name": "analysis-team",                // string: team name (unique identifier)
+  "description": "Team description",      // string: purpose
+  "createdAt": 1770535107409,             // number: Unix millisecond timestamp
+  "leadAgentId": "team-lead@analysis-team", // string: "{name}@{team}" format
+  "leadSessionId": "c93b690c-...",        // string: Lead's session UUID
+
+  // === Member list ===
+  "members": [
+    // --- Team Lead (8 fields) ---
+    {
+      "agentId": "team-lead@analysis-team",  // string: {name}@{team}
+      "name": "team-lead",                   // string: messaging identifier
+      "agentType": "team-lead",              // string: fixed value
+      "model": "claude-opus-4-6",            // string: model ID
+      "joinedAt": 1770535107409,             // number: Unix ms timestamp
+      "tmuxPaneId": "",                      // string: empty for Lead
+      "cwd": "/path/to/project",             // string: working directory
+      "subscriptions": []                    // array: reserved field (no runtime effect)
+    },
+
+    // --- Teammate (13 fields) ---
+    {
+      "agentId": "researcher-01@analysis-team", // string: {name}@{team}
+      "name": "researcher-01",               // string: used as SendMessage recipient
+      "agentType": "general-purpose",        // string: "general-purpose"|"Explore"|"Plan"|"Bash"
+      "model": "claude-opus-4-6",            // string: model ID
+      "prompt": "You are a member of analysis-team...", // string: initial instructions (Lead lacks this)
+      "color": "blue",                       // string: UI color identifier (Lead lacks this)
+      "planModeRequired": false,             // boolean: default false (Lead lacks this)
+      "joinedAt": 1770535144590,             // number: Unix ms timestamp
+      "tmuxPaneId": "%14",                   // string: tmux pane ID (Lead has empty string)
+      "cwd": "/path/to/project",             // string: working directory
+      "subscriptions": [],                   // array: reserved field
+      "backendType": "tmux",                 // string: "tmux"|"in-process" (Lead lacks this)
+      "isActive": true                       // boolean: active true / idle false (Lead lacks this)
+    }
+  ]
+}
+```
+
+**Lead vs Teammate field comparison**:
+
+| Field | Lead (8) | Teammate (13) | Notes |
+|---|---|---|---|
+| `agentId` | Yes | Yes | Shared |
+| `name` | Yes | Yes | Shared |
+| `agentType` | Yes (`"team-lead"`) | Yes (`"general-purpose"` etc.) | Shared |
+| `model` | Yes | Yes | Shared |
+| `joinedAt` | Yes | Yes | Shared |
+| `tmuxPaneId` | Yes (`""`) | Yes (`"%14"` etc.) | Shared (Lead is empty string) |
+| `cwd` | Yes | Yes | Shared |
+| `subscriptions` | Yes (`[]`) | Yes (`[]`) | Shared (reserved field) |
+| `prompt` | No | Yes | Teammate only |
+| `color` | No | Yes | Teammate only |
+| `planModeRequired` | No | Yes | Teammate only (default `false`) |
+| `backendType` | No | Yes | Teammate only |
+| `isActive` | No | Yes | Teammate only |
+
+**Member lifecycle**: After termination, the agent's entry is **completely removed** from the `members` array (not marked inactive).
+
+---
+
+### C.4 Task File Complete Schema
+
+**Path**: `~/.claude/tasks/{team_name}/{id}.json`
+
+```jsonc
+{
+  "id": "1",                              // string: auto-incrementing ID
+  "subject": "Analyze config file structure", // string: task title (imperative mood)
+  "description": "Detailed description...", // string: task details and acceptance criteria
+  "activeForm": "Analyzing config file structure", // string: display text when in_progress (present continuous)
+  "status": "pending",                    // string: "pending"|"in_progress"|"completed"|"deleted"
+  "owner": "researcher-01",              // string|undefined: assignee name (absent on creation)
+  "blocks": ["4"],                        // string[]: downstream task IDs blocked by this task
+  "blockedBy": [],                        // string[]: upstream task IDs blocking this task
+  "metadata": {}                          // object|undefined: additional metadata (absent on creation)
+}
+```
+
+**State machine**: `pending` → `in_progress` → `completed` (`deleted` is a terminal state, reachable from any state)
+
+**Dependencies**: `blocks` / `blockedBy` are system-maintained bidirectional references (setting one side auto-updates the other).
+
+**Concurrency control**: `.lock` file (0 bytes) in the same directory for filesystem-level locking.
+
+---
+
+### C.5 Agent CLI Parameters Complete List
+
+```bash
+/Users/night/.local/share/claude/versions/{version} \
+  --agent-id {name}@{team}             \  # Globally unique ID (required)
+  --agent-name {name}                  \  # Human-readable name (required)
+  --team-name {team}                   \  # Team affiliation (required)
+  --agent-color {color}                \  # UI color (required)
+  --parent-session-id {uuid}           \  # Lead session ID (required)
+  --agent-type {type}                  \  # Agent type (required)
+  --model {model_id}                   \  # LLM model (required)
+  --plan-mode-required                 \  # Conditional: Task mode="plan" (independent boolean flag)
+  --dangerously-skip-permissions       \  # Conditional: inherited when Lead uses this mode
+  --permission-mode {mode}             \  # Conditional: Task mode="delegate" → "acceptEdits"
+  --allowedTools "..."                 \  # Conditional: tool whitelist
+  --disallowedTools "..."                 # Conditional: tool blacklist
+```
+
+**Task tool `mode` parameter to CLI mapping**:
+
+| Task tool `mode` | CLI Parameter | config.json Field |
+|---|---|---|
+| `"plan"` | `--plan-mode-required` | `planModeRequired: true` |
+| `"delegate"` | `--permission-mode acceptEdits` | None (not recorded in config.json) |
+| `"acceptEdits"` | `--permission-mode acceptEdits` | None |
+| `"bypassPermissions"` | `--dangerously-skip-permissions` | None |
+| Not specified | No `--permission-mode` | None |
+
+---
+
+### C.6 requestId Naming Conventions and Formats
+
+| Message Type | ID Field Name | Format Template | Naming Style |
+|---|---|---|---|
+| shutdown_request | `requestId` | `shutdown-{epoch_ms}@{agentName}` | camelCase |
+| shutdown_approved | `requestId` | Same as request | camelCase |
+| plan_approval_request | `requestId` | `plan_approval-{epoch_ms}@{agentName}@{teamName}` | camelCase |
+| plan_approval_response | `requestId` | Same as request | camelCase |
+| permission_request | `request_id` | `perm-{epoch_ms}-{random_7char}` | **snake_case** |
+| permission_response | `request_id` | Same as request | **snake_case** |
+
+> The shutdown/plan families use camelCase `requestId`, while the permission family uses snake_case `request_id`. This is a protocol-level naming inconsistency.
+
+---
+
+### C.7 Key Directory and File Structure
+
+```
+~/.claude/
+├── teams/{team_name}/
+│   ├── config.json                    # Team config (see C.3)
+│   └── inboxes/
+│       ├── team-lead.json             # Lead inbox (see C.1)
+│       └── {agentName}.json           # Agent inbox (see C.1)
+│
+├── tasks/{team_name}/
+│   ├── .lock                          # Concurrency lock (0 bytes)
+│   └── {id}.json                      # Task file (see C.4)
+│
+├── plans/
+│   └── {random-name}.md               # Plan Mode plan files
+│
+├── shell-snapshots/
+│   └── snapshot-zsh-{ts}-{id}.sh      # Shell environment snapshots
+│
+├── session-env/{session-uuid}/         # Session environments
+├── debug/{session-uuid}.txt            # Debug logs (latest symlink points to newest)
+│
+├── projects/{project-path}/
+│   └── {session-id}.jsonl             # Conversation history (JSONL format)
+│
+└── /tmp/claude-{uid}/{project-path-escaped}/
+    └── tasks/{hash}.output            # Task subagent intermediate outputs
+```
+
+---
+
+### C.8 Message Type Quick Reference
+
+| Message Type | `text` Format | Trigger Source | Delivery | Inner Field Count |
+|---|---|---|---|---|
+| Regular message | Plain text | `SendMessage(message/broadcast)` | Inbox file | — |
+| `task_assignment` | JSON | `TaskUpdate(owner=X)` | Inbox file | 6 |
+| `idle_notification` | JSON | Agent turn ends (system) | Inbox file | 4–5 |
+| `shutdown_request` | JSON | `SendMessage(shutdown_request)` | Inbox file | 5 |
+| `shutdown_approved` | JSON | Agent approves shutdown | Inbox file | 6 |
+| `plan_approval_request` | JSON | Agent `ExitPlanMode` | Inbox file | 6 |
+| `plan_approval_response` | JSON | System auto-approval / Lead manual | Inbox file | 4–5 |
+| `permission_request` | JSON | Agent performs restricted op | Inbox file | 8 |
+| `permission_response` | JSON | User UI approval | Inbox file | 3–4 |
+| `teammate_terminated` | — | Process terminates (system) | **Turn injection** (NOT inbox) | — |
